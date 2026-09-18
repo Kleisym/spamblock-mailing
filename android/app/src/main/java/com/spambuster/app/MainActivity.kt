@@ -10,16 +10,23 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.text.InputType
+import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.spambuster.app.databinding.ActivityMainBinding
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), BotBridgeCoordinator.UiListener {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: SharedPreferences
+
+    private var codeDialog: AlertDialog? = null
+    private var passwordDialog: AlertDialog? = null
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -44,7 +51,22 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        BotBridgeCoordinator.uiListener = this
         updateStatusUi()
+
+        if (BotBridgeCoordinator.isWaitingForCode) {
+            showCodeInputDialog()
+        }
+        if (BotBridgeCoordinator.isWaitingForPassword) {
+            showPasswordInputDialog()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (BotBridgeCoordinator.uiListener === this) {
+            BotBridgeCoordinator.uiListener = null
+        }
     }
 
     private fun loadSavedData() {
@@ -81,6 +103,10 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Пожалуйста, введите API ID и API Hash", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
+            if (phone.isEmpty()) {
+                Toast.makeText(this, "Пожалуйста, введите номер телефона", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
 
             saveData()
 
@@ -88,8 +114,10 @@ class MainActivity : AppCompatActivity() {
             ContextCompat.startForegroundService(this, serviceIntent)
 
             prefs.edit().putBoolean(SpambusterService.KEY_SERVICE_ENABLED, true).apply()
+            BotBridgeCoordinator.lastStatus = "Запуск юзербота..."
+            BotBridgeCoordinator.isBotRunning = true
             updateStatusUi()
-            Toast.makeText(this, "✅ Spambuster запущен в фоне 24/7!", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "🚀 Запуск Spambuster...", Toast.LENGTH_SHORT).show()
         }
 
         binding.btnStop.setOnClickListener {
@@ -99,6 +127,8 @@ class MainActivity : AppCompatActivity() {
             startService(stopIntent)
 
             prefs.edit().putBoolean(SpambusterService.KEY_SERVICE_ENABLED, false).apply()
+            BotBridgeCoordinator.lastStatus = "Остановлен"
+            BotBridgeCoordinator.isBotRunning = false
             updateStatusUi()
             Toast.makeText(this, "⏹ Фоновая работа остановлена", Toast.LENGTH_SHORT).show()
         }
@@ -129,15 +159,115 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateStatusUi() {
-        val isEnabled = prefs.getBoolean(SpambusterService.KEY_SERVICE_ENABLED, false)
-        if (isEnabled) {
-            binding.tvStatus.text = "Статус: Работает 24/7 в фоне"
+        val isRunning = BotBridgeCoordinator.isBotRunning
+        val statusText = BotBridgeCoordinator.lastStatus
+
+        binding.tvStatus.text = "Статус: $statusText"
+        if (isRunning) {
             binding.tvStatus.setTextColor(ContextCompat.getColor(this, R.color.accent_green))
             binding.viewStatusDot.setBackgroundResource(R.drawable.status_dot_green)
         } else {
-            binding.tvStatus.text = "Статус: Остановлен"
             binding.tvStatus.setTextColor(ContextCompat.getColor(this, R.color.white))
             binding.viewStatusDot.setBackgroundResource(R.drawable.status_dot_red)
+        }
+    }
+
+    private fun showCodeInputDialog() {
+        if (isFinishing || isDestroyed) return
+        if (codeDialog?.isShowing == true) return
+
+        val input = EditText(this).apply {
+            hint = "12345"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+        }
+
+        val container = FrameLayout(this).apply {
+            val pad = (20 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad / 2, pad, pad / 2)
+            addView(input)
+        }
+
+        codeDialog = AlertDialog.Builder(this)
+            .setTitle("Код подтверждения Telegram")
+            .setMessage("Введите код, отправленный в официальный Telegram чат:")
+            .setView(container)
+            .setCancelable(false)
+            .setPositiveButton("Подтвердить") { _, _ ->
+                val code = input.text.toString().trim()
+                BotBridgeCoordinator.submitCode(code)
+            }
+            .setNegativeButton("Отмена") { _, _ ->
+                BotBridgeCoordinator.cancelWait()
+            }
+            .create()
+
+        codeDialog?.show()
+    }
+
+    private fun showPasswordInputDialog() {
+        if (isFinishing || isDestroyed) return
+        if (passwordDialog?.isShowing == true) return
+
+        val input = EditText(this).apply {
+            hint = "Пароль 2FA"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setSingleLine(true)
+        }
+
+        val container = FrameLayout(this).apply {
+            val pad = (20 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad / 2, pad, pad / 2)
+            addView(input)
+        }
+
+        passwordDialog = AlertDialog.Builder(this)
+            .setTitle("Двухфакторная защита (2FA)")
+            .setMessage("На аккаунте включен 2FA. Введите облачный пароль:")
+            .setView(container)
+            .setCancelable(false)
+            .setPositiveButton("Войти") { _, _ ->
+                val pwd = input.text.toString().trim()
+                BotBridgeCoordinator.submitPassword(pwd)
+            }
+            .setNegativeButton("Отмена") { _, _ ->
+                BotBridgeCoordinator.cancelWait()
+            }
+            .create()
+
+        passwordDialog?.show()
+    }
+
+    // BotBridgeCoordinator.UiListener Callbacks
+    override fun onCodeRequested() {
+        runOnUiThread {
+            showCodeInputDialog()
+        }
+    }
+
+    override fun onPasswordRequested() {
+        runOnUiThread {
+            showPasswordInputDialog()
+        }
+    }
+
+    override fun onStatusChanged(status: String, isRunning: Boolean) {
+        runOnUiThread {
+            updateStatusUi()
+        }
+    }
+
+    override fun onLoggedIn(username: String, userId: Long) {
+        runOnUiThread {
+            Toast.makeText(this, "✅ Успешный вход в аккаунт $username (ID: $userId)", Toast.LENGTH_LONG).show()
+            updateStatusUi()
+        }
+    }
+
+    override fun onError(error: String) {
+        runOnUiThread {
+            Toast.makeText(this, "❌ Ошибка: $error", Toast.LENGTH_LONG).show()
+            updateStatusUi()
         }
     }
 }
