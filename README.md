@@ -53,8 +53,8 @@
 
 ```bash
 # 1. Клонируем проект
-git clone https://github.com/твой_юзернейм/твой_репозиторий.git
-cd твой_репозиторий
+git clone https://github.com/Kleisym/spamblock-mailing.git
+cd spamblock-mailing
 
 # 2. Создаем виртуальное окружение
 python -m venv venv
@@ -244,13 +244,13 @@ python bot.py
 
 ### Android:
 
-#### Вариант 1: Готовый APK (папка `android/`)
-В репозитории лежит проект Android-приложения:
+#### Вариант 1: Готовый APK (приложение для телефона)
+Скачать готовый `.apk` можно в разделе **[Releases](https://github.com/Kleisym/spamblock-mailing/releases)**:
 - Простой интерфейс: вводишь API ID, Hash, телефон, жмешь «Запустить 24/7».
 - Работает через `Foreground Service` с постоянным уведомлением и блокировкой сна (`WakeLock`) — процессор не засыпает при выключенном экране.
 - Сам перезапускается при перезагрузке смартфона (`BootReceiver`).
 - Есть кнопка отключения оптимизации батареи, чтобы агрессивные оболочки (MIUI, OneUI, HyperOS) не выгружали процесс.
-- В репозитории настроен GitHub Actions (`.github/workflows/build-apk.yml`) — при каждом коммите GitHub сам собирает свежий APK во вкладке **Actions** -> **Artifacts**.
+- В репозитории настроен GitHub Actions (`.github/workflows/build-apk.yml`) — при каждом пуше GitHub сам собирает свежий APK и выкладывает его во вкладку Releases.
 
 #### Вариант 2: Через Termux
 Если привычнее консоль:
