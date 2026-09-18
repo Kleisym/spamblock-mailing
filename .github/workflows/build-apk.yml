@@ -23,6 +23,16 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Sync bot.py to Android python sources
+        run: |
+          mkdir -p android/app/src/main/python
+          cp bot.py android/app/src/main/python/bot.py
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -58,8 +68,10 @@ jobs:
             ### 📱 Скачать приложение для Android
             Скачай файл **spambuster.apk** ниже, установи на телефон и нажми «Запустить».
 
+            - **Вшит полноценный Python + Telethon** (Chaquopy)
+            - Запрос кода авторизации и 2FA прямо в диалоговом окне приложения
             - Работает в фоне 24/7 (Foreground Service + WakeLock)
-            - Автоматически перезапускается после перезагрузки телефона
+            - Автоматически перезапускается после перезагрузки телефона (BootReceiver)
             - Обход энергосбережения MIUI / OneUI / HyperOS
           files: spambuster.apk
         env:
