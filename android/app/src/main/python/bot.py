@@ -750,27 +750,38 @@ except Exception:
 ACTIVE_COLLECTORS: Dict[Any, Dict[str, Any]] = {}
 
 SPAM_SIGNATURES = [
-    r"отправлено\s+с\s+помощью\s+@?\w+",
-    r"рассылаю\s+через\s+@?\w+",
-    r"передано\s+через\s+@?\w+",
-    r"ninjaautopostbot",
-    r"@jrvsu",
-    r"@jrvusvu",
-    r"скупаю\s+такие\s+штукенции",
-    r"скупаю\s+голду",
-    r"подарки\s+ниже\s+флора",
-    r"аккаунты\s+рф\s+скупаю",
-    r"продаю\s+смену\s+номера",
-    r"продам\s+сайт\s+где\s+\+7",
-    r"продаю\s+зв[её]зды",
-    r"продажа\s+зв[её]зд",
+    # 1. Any broadcaster / userbot watermarks (Russian & English):
+    r"(?:отправлено|рассылаю|рассылка|рассылается|передано|переслано|опубликовано|запощено|размещено|сделано|постинг|автопост|автопостинг|создано|работает)\s+(?:с\s+помощью|через|с|в)\s+@?[a-zA-Z0-9_]{3,32}",
+    r"(?:sent|posted|broadcasted|forwarded|powered|created)\s+(?:via|by|with|through)\s+@?[a-zA-Z0-9_]{3,32}",
+
+    # 2. Promotional software / bot mentions
+    r"(?:скрипт|софт|программ\w*|бот)\s+(?:для\s+)?(?:рассыл|спам|автопост|трафик|пиар|реклам|инвайт)\w*\s*[:\-—]?\s*@?\w+",
+    r"@[a-zA-Z0-9_]*(?:autopost|sender|spambot|postbot|mailer|blast|repost|prbot|trafficbot|mailing)[a-zA-Z0-9_]*",
+    r"заказать\s+(?:рассылку|спам|рекламу|трафик|инвайтинг)",
+
+    # 3. Seller routing & channels lists
+    r"(?:пишите|писать|связь|обращаться|отпишите)\s+(?:в\s+лс|в\s+личку|менеджеру|сюда)?\s*[:\-—]?\s*@\w+",
+    r"(?:по\s+поводу\s+(?:рекламы|покупки|сотрудничества)|для\s+заказа)\s*[:\-—]?\s*@\w+",
+    r"(?:наш\s+(?:канал|чат|бот|шоп|магазин)|вход\s+в\s+чат)\s*[:\-—]?\s*(?:https?://)?t\.me/\+?[a-zA-Z0-9_]+",
+
+    # 4. Catalog bullet points with @ channels or links
+    r"[1-9]️⃣\s*@\w+",
+    r"[①-⑩]\s*@\w+",
+
+    # 5. Product/service selling
+    r"продам\s+канал[ыа]?",
+    r"продам\s+(?:акк[иа]?|аккаунт[ыа]?|сетку|базу|групп[уыа]|бота|клики)",
+    r"прода[юе]тся\s+канал[ыа]?",
+    r"скупаю\s+(?:канал[ыа]?|акк[иа]?|аккаунт[ыа]?|групп[уыа]|голду|штукенции)",
     r"без\s+спам\s*блока",
     r"без\s+пароля",
-    r"в\s+оп\s*/\s*задания\s+в\s+боте",
     r"\d+\s*кликов\s*[-–—:]",
     r"клики\s*:",
     r"телеграмм\s+аккаунты\s*:",
     r"купить\s+можно\s+за\s+звезды",
+    r"прода[южа]\s+зв[её]зд",
+    r"казино|гемблинг|азарт|1win|stake",
+    r"подарки\s+ниже\s+флора",
 ]
 
 SPAM_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SPAM_SIGNATURES]
@@ -787,7 +798,7 @@ BUYER_QUESTION_TRIGGERS = [
     r"\bстатистик[ау]\b",
     r"\bохват\b",
     r"\bчекни\s+лс\b",
-    r"\bв\s+лс\b",
+    r"\bответь(?:те)?\s+в\s+лс\b",
     r"\bотпиши\b",
     r"\bкуплю\s+рекламу\b",
     r"\bхочу\s+купить\b",
@@ -813,44 +824,102 @@ VERIFY_BUTTON_TEXTS = [
     "вступил", "продолжить", "check", "done", "verify", "i subscribed"
 ]
 
-def is_spam_message(text: str) -> Tuple[bool, str]:
+def is_spam_message(text: str, message: Any = None) -> Tuple[bool, str]:
     if not text:
         return False, ""
     clean_text = text.lower()
+    lines = [l.strip() for l in clean_text.splitlines() if l.strip()]
+
+    # 0. Messages sent via inline bot (auto-posters, formatted bots)
+    if message and getattr(message, "via_bot_id", None):
+        return True, "sent_via_inline_bot"
+
+    # 0.1 Invisible ghost pings (zero-width spaces used by spammers for mass tagging)
+    if re.search(r"[\u200b-\u200f\u2060-\u206f\ufeff]", text):
+        return True, "invisible_ghost_ping"
+
+    # 1. Direct pattern matching from signatures (auto-posting bots, userbots)
     for pat in SPAM_PATTERNS:
         if pat.search(clean_text):
             return True, pat.pattern
 
+    # 2. Country flags in mass account lists
     flag_count = sum(1 for flag in COUNTRY_FLAGS if flag in text)
     if flag_count >= 3 and ("⭐️" in text or "🌟" in text or "аккаунт" in clean_text):
         return True, "mass_account_price_list"
 
-    lines = [l.strip() for l in clean_text.splitlines() if l.strip()]
+    # 3. Seller contact routing (directing traffic to DM, manager, bot)
+    has_seller_contact = bool(re.search(r'(?:пишите|писать|связь|обращаться|отпишите|в\s+лс|лс)\s*[:\-—]?\s*@\w+', clean_text))
+
+    # 4. Numbered list / catalog items (1️⃣, 2️⃣, 3️⃣...)
+    has_numbered_list = bool(re.search(r'[1-9]️⃣|[①-⑩]|\b1\s*[\)\.\-—]\s*@|\b2\s*[\)\.\-—]\s*@', clean_text))
+
+    # 5. Promo links (t.me/+, joinchat, or channel usernames)
+    promo_links = re.findall(r't\.me/(?:\+|joinchat/|[a-zA-Z0-9_]{5,})', clean_text)
+    has_promo_links = len(promo_links) >= 1
+
+    # 6. Commercial sale/service keywords
+    has_sale_keywords = bool(re.search(r'\b(?:продам|продаю|прода[её]тся|скупаю|продажа|покупка|услуги|клики|аккаунты|накрутка|казино|гемблинг|азарт)\b', clean_text))
+
+    # Structured promo post (like Malone's: lists of channels/items + seller contact or sales pitch)
+    if (has_numbered_list or has_promo_links) and (has_seller_contact or has_sale_keywords):
+        return True, "structured_promo_post"
+
+    if has_sale_keywords and has_seller_contact:
+        return True, "sale_with_seller_contact"
+
+    # Multi-line formatted price list / matrix
     price_lines = sum(1 for l in lines if any(s in l for s in ("-", "—", "–", ":", "$", "₽", "🌟", "⭐️", "руб")) and len(l) < 50)
-    if len(lines) >= 4 and price_lines >= 3 and any(k in clean_text for k in ("продам", "продаю", "скупаю", "аккаунт")):
+    if len(lines) >= 3 and price_lines >= 2 and has_sale_keywords:
         return True, "price_list_matrix"
+
+    # Long commercial broadcast with multiple mentions/links
+    if len(lines) >= 3 and has_sale_keywords and (len(re.findall(r'[@#]', clean_text)) >= 2 or has_promo_links):
+        return True, "multiline_ad_catalog"
 
     return False, ""
 
 def is_genuine_buyer_question(text: str) -> bool:
     if not text:
         return False
-    is_spam, _ = is_spam_message(text)
-    if is_spam:
-        return False
     clean_text = text.lower().strip()
-    if len(clean_text) < 160:
-        for pat in BUYER_PATTERNS:
-            if pat.search(clean_text):
-                return True
-        if "?" in clean_text and any(w in clean_text for w in ("привет", "ку", "салам", "реклам", "канал", "место", "пост")):
-            return True
+
+    # Never consider a message a buyer question if it contains seller contact directing to another username
+    if re.search(r'(?:пишите|писать|связь|обращаться|отпишите)\s*[:\-—]?\s*@\w+', clean_text):
+        return False
+
+    # Never consider catalog/product lists as buyer questions
+    if re.search(r'[1-9]️⃣|[①-⑩]', clean_text):
+        return False
+
+    # Never consider mass price lists as buyer questions
+    if sum(1 for flag in COUNTRY_FLAGS if flag in text) >= 2:
+        return False
+
+    has_q_mark = "?" in clean_text
+    buyer_triggers = [
+        r"\bпоч[её]м\b", r"\bцена\b", r"\bцену\b", r"\bпрайс\b", r"\bактуально\b",
+        r"\bсвободно\b", r"\bстат[уа]\b", r"\bстатистик[ау]\b", r"\bохват\b",
+        r"\bчекни\s+лс\b", r"\bответь(?:те)?\s+в\s+лс\b", r"\bкуплю\b", r"\bхочу\s+купить\b",
+        r"\bпродашь\b", r"\bпрода[её]шь\b", r"\bпрода[её]те\b",
+        r"\bможно\s+(?:купить|взять|разместить|заказать)\b",
+        r"\bместо\s+есть\b", r"\bесть\s+место\b"
+    ]
+    matches_buyer_trigger = any(re.search(p, clean_text) for p in buyer_triggers)
+
+    # Conversational questions are short (< 220 chars) and either have ? or clear buyer trigger phrase
+    if (has_q_mark or matches_buyer_trigger) and len(clean_text) < 220:
+        # If it's a broadcast offering goods for sale ("Продам каналы"), it's not a buyer asking
+        if re.search(r'\b(?:продам|продаю|скупаю|продажа)\s+(?:канал|акк|сетк|групп|баз|бот)', clean_text):
+            return False
+        return True
+
     return False
 
-def should_auto_read(text: str) -> bool:
+def should_auto_read(text: str, message: Any = None) -> bool:
     if is_genuine_buyer_question(text):
         return False
-    is_spam, _ = is_spam_message(text)
+    is_spam, _ = is_spam_message(text, message)
     return is_spam
 
 def is_gatekeeper_text(text: str) -> bool:
@@ -1079,23 +1148,71 @@ def _extract_folder_title(dialog_filter: Any) -> str:
 async def get_chats_in_folder(client: TelegramClient, folder_name: str) -> List[int]:
     result = await client(GetDialogFiltersRequest())
     target_clean = folder_name.lower().strip()
-    chat_ids = []
+    target_filter = None
 
     for f in getattr(result, "filters", []):
-        if not isinstance(f, DialogFilter):
-            continue
-        title = _extract_folder_title(f).lower()
-        if title == target_clean:
-            peers = list(getattr(f, "include_peers", [])) + list(getattr(f, "pinned_peers", []))
-            for peer in peers:
-                try:
-                    cid = utils.get_peer_id(peer)
-                    if cid not in chat_ids:
-                        chat_ids.append(cid)
-                except Exception:
+        if isinstance(f, DialogFilter):
+            title = _extract_folder_title(f).lower()
+            if title == target_clean:
+                target_filter = f
+                break
+
+    if not target_filter:
+        return []
+
+    chat_ids = set()
+    for peer in list(getattr(target_filter, "include_peers", [])) + list(getattr(target_filter, "pinned_peers", [])):
+        try:
+            cid = utils.get_peer_id(peer)
+            chat_ids.add(cid)
+        except Exception:
+            pass
+
+    exclude_ids = set()
+    for peer in getattr(target_filter, "exclude_peers", []):
+        try:
+            cid = utils.get_peer_id(peer)
+            exclude_ids.add(cid)
+        except Exception:
+            pass
+
+    has_flags = any([
+        getattr(target_filter, "groups", False),
+        getattr(target_filter, "broadcasts", False),
+        getattr(target_filter, "contacts", False),
+        getattr(target_filter, "non_contacts", False),
+        getattr(target_filter, "bots", False),
+    ])
+
+    if has_flags:
+        try:
+            async for dialog in client.iter_dialogs(limit=300):
+                cid = dialog.id
+                if cid in exclude_ids:
                     continue
-            break
-    return chat_ids
+                if getattr(target_filter, "exclude_muted", False) and getattr(getattr(dialog, "dialog", None), "notify_settings", None) and getattr(dialog.dialog.notify_settings, "silent", False):
+                    continue
+                if getattr(target_filter, "exclude_archived", False) and getattr(dialog, "archived", False):
+                    continue
+
+                matched = False
+                if getattr(target_filter, "groups", False) and (dialog.is_group or (dialog.is_channel and not getattr(dialog.entity, "broadcast", False))):
+                    matched = True
+                elif getattr(target_filter, "broadcasts", False) and dialog.is_channel and getattr(dialog.entity, "broadcast", False):
+                    matched = True
+                elif getattr(target_filter, "contacts", False) and dialog.is_user and getattr(getattr(dialog.entity, "contact", None), "contact", False):
+                    matched = True
+                elif getattr(target_filter, "non_contacts", False) and dialog.is_user and not getattr(getattr(dialog.entity, "contact", None), "contact", False):
+                    matched = True
+                elif getattr(target_filter, "bots", False) and dialog.is_user and getattr(dialog.entity, "bot", False):
+                    matched = True
+
+                if matched:
+                    chat_ids.add(cid)
+        except Exception:
+            pass
+
+    return [cid for cid in chat_ids if cid not in exclude_ids]
 
 async def mute_peer(client: TelegramClient, peer: Any):
     try:
@@ -1192,6 +1309,14 @@ async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: An
         await client(ReadMentionsRequest(peer=input_chat))
     except Exception:
         pass
+    try:
+        msg_id = getattr(message, "id", 0)
+        if msg_id:
+            from telethon.tl.functions.channels import ReadHistoryRequest
+            input_chat = await client.get_input_entity(chat_peer)
+            await client(ReadHistoryRequest(channel=input_chat, max_id=msg_id))
+    except Exception:
+        pass
 
 class BroadcasterService:
     def __init__(self, client: TelegramClient, account_id: int = 0):
@@ -1231,7 +1356,9 @@ class BroadcasterService:
                         effective_name = rotation_tpl if rotation_tpl else template_name
 
                         db.update_task_last_sent(task["id"])
-                        await self._send_task(task["id"], chat_id, effective_name)
+                        await self._send_task(task["id"], chat_id, effective_name, task=task)
+                        # Small delay between different chats in interval batch to avoid flood ban
+                        await asyncio.sleep(1.5)
 
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
@@ -1247,9 +1374,9 @@ class BroadcasterService:
             effective_name = rotation_tpl if rotation_tpl else template_name
 
             log_info(f"[COUNTER] Чат {chat_id}: набрано {task['counter_threshold']} сообщений. Отправляю пост '{effective_name}'...")
-            await self._send_task(task["id"], chat_id, effective_name)
+            await self._send_task(task["id"], chat_id, effective_name, task=task)
 
-    async def _send_task(self, task_id: int, chat_id: int, template_name: str) -> bool:
+    async def _send_task(self, task_id: int, chat_id: int, template_name: str, task: Optional[Dict[str, Any]] = None) -> bool:
         template = db.get_template(template_name)
         if not template:
             log_error(f"[ERROR] Шаблон '{template_name}' не найден в базе данных")
@@ -1266,13 +1393,25 @@ class BroadcasterService:
                 bundle=template.get("bundle")
             )
             return True
+        except errors.SlowModeWaitError as e:
+            log_error(f"[SLOWMODE] Медленный режим в чате {chat_id}: нужно подождать {e.seconds}с")
+            if task and task.get("mode") == "interval":
+                try:
+                    with db._conn() as conn:
+                        conn.execute("UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?", (time.time() - task.get("interval_seconds", 0) + e.seconds + 2, task_id))
+                except Exception:
+                    pass
+            return False
         except errors.FloodWaitError as e:
             log_error(f"[FLOOD] Задержка FloodWait {e.seconds}с в чате {chat_id}")
-            await asyncio.sleep(e.seconds + 1)
+            await asyncio.sleep(min(e.seconds + 1, 60))
             return False
-        except (errors.ChatWriteForbiddenError, errors.UserBannedInChannelError, errors.ChannelPrivateError) as e:
-            log_error(f"[PERM] Нет прав на отправку в чат {chat_id} ({type(e).__name__}). Рассылка отключена.")
+        except (errors.UserBannedInChannelError, errors.ChannelPrivateError) as e:
+            log_error(f"[PERM] Аккаунт удален/забанен в чате {chat_id} ({type(e).__name__}). Рассылка отключена.")
             db.set_broadcast_status(name=template_name, chat_id=chat_id, is_active=0, account_id=self.account_id)
+            return False
+        except errors.ChatWriteForbiddenError as e:
+            log_error(f"[RESTRICT] Чат {chat_id}: отправка временно ограничена администрацией ({e}). Рассылка не отключена, повтор позже.")
             return False
         except Exception as e:
             log_error(f"[ERROR] Ошибка отправки рассылки в чат {chat_id}: {e}")
@@ -1461,7 +1600,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 except Exception:
                     pass
 
-            if is_relevant_ping and should_auto_read(text):
+            if is_relevant_ping and should_auto_read(text, event.message):
                 await clear_spam_mention(client, chat_id, event.message)
 
         if auto_sub and is_gatekeeper_text(text):
