@@ -25,6 +25,7 @@ from telethon.tl.functions.messages import (
 )
 from telethon.tl.types import (
     DialogFilter,
+    DialogFilterChatlist,
     InputNotifyPeer,
     InputPeerNotifySettings,
     TextWithEntities,
@@ -249,9 +250,10 @@ class Database:
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         try:
+            conn.execute("PRAGMA busy_timeout=30000;")
             yield conn
             conn.commit()
         finally:
@@ -260,6 +262,10 @@ class Database:
     def _init_db(self):
         with self._conn() as conn:
             cursor = conn.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL;")
+            except Exception:
+                pass
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS templates (
                     name TEXT PRIMARY KEY,
@@ -299,6 +305,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id INTEGER DEFAULT 0,
                     chat_id INTEGER,
+                    name TEXT DEFAULT '',
                     template_names TEXT,
                     current_index INTEGER DEFAULT 0,
                     is_active INTEGER DEFAULT 1
@@ -318,6 +325,8 @@ class Database:
                 cols = [r["name"] for r in cursor.fetchall()]
                 if "account_id" not in cols:
                     cursor.execute("ALTER TABLE chat_rotations ADD COLUMN account_id INTEGER DEFAULT 0")
+                if "name" not in cols:
+                    cursor.execute("ALTER TABLE chat_rotations ADD COLUMN name TEXT DEFAULT ''")
             except Exception:
                 pass
 
@@ -347,21 +356,6 @@ class Database:
                     new_names = [n.strip("<>").strip() for n in names if n.strip("<>").strip()]
                     if new_names != names:
                         cursor.execute("UPDATE chat_rotations SET template_names = ? WHERE id = ?", (json.dumps(new_names), r["id"]))
-
-                # Purge orphaned rotations where templates no longer exist
-                cursor.execute("SELECT id, chat_id, template_names FROM chat_rotations")
-                for r in cursor.fetchall():
-                    names = json.loads(r["template_names"]) if r["template_names"] else []
-                    valid = []
-                    for n in names:
-                        clean = n.strip("<>").strip()
-                        cursor.execute("SELECT 1 FROM templates WHERE name = ? OR name = ?", (clean, f"<{clean}>"))
-                        if cursor.fetchone():
-                            valid.append(clean)
-                    if not valid:
-                        cursor.execute("DELETE FROM chat_rotations WHERE id = ?", (r["id"],))
-                    elif len(valid) != len(names):
-                        cursor.execute("UPDATE chat_rotations SET template_names = ? WHERE id = ?", (json.dumps(valid), r["id"]))
             except Exception:
                 pass
 
@@ -480,54 +474,105 @@ class Database:
             if account_id:
                 cursor.execute("""
                     SELECT * FROM broadcast_tasks 
-                    WHERE is_active = 1 AND mode = 'interval' AND interval_seconds > 0
+                    WHERE is_active = 1 AND mode IN ('interval', 'hybrid') AND interval_seconds > 0
                     AND (account_id = ? OR account_id = 0)
                 """, (account_id,))
             else:
                 cursor.execute("""
                     SELECT * FROM broadcast_tasks 
-                    WHERE is_active = 1 AND mode = 'interval' AND interval_seconds > 0
+                    WHERE is_active = 1 AND mode IN ('interval', 'hybrid') AND interval_seconds > 0
                 """)
             return [dict(r) for r in cursor.fetchall()]
 
     def increment_and_check_counter(self, chat_id: int, account_id: int = 0) -> List[Dict[str, Any]]:
         ready_tasks = []
+        now = time.time()
         with self._conn() as conn:
             cursor = conn.cursor()
             if account_id:
                 cursor.execute("""
                     SELECT * FROM broadcast_tasks 
-                    WHERE chat_id = ? AND is_active = 1 AND mode = 'counter'
+                    WHERE chat_id = ? AND is_active = 1 AND mode IN ('counter', 'hybrid')
                     AND (account_id = ? OR account_id = 0)
                 """, (chat_id, account_id))
             else:
                 cursor.execute("""
                     SELECT * FROM broadcast_tasks 
-                    WHERE chat_id = ? AND is_active = 1 AND mode = 'counter'
+                    WHERE chat_id = ? AND is_active = 1 AND mode IN ('counter', 'hybrid')
                 """, (chat_id,))
             tasks = cursor.fetchall()
-            for t in tasks:
+            for row in tasks:
+                t = dict(row)
                 new_count = t["current_count"] + 1
-                log_info(f"[COUNT] Чат {chat_id}: сообщение #{new_count}/{t['counter_threshold']} для рассылки '{t['template_name']}'")
-                if new_count >= t["counter_threshold"]:
-                    ready_tasks.append(dict(t))
-                    cursor.execute("""
-                        UPDATE broadcast_tasks 
-                        SET current_count = 0, last_sent_at = ? 
-                        WHERE id = ?
-                    """, (time.time(), t["id"]))
+                mode = t.get("mode", "counter")
+                threshold = t["counter_threshold"]
+                log_info(f"[COUNT] Чат {chat_id}: сообщение #{new_count}/{threshold} для рассылки '{t['template_name']}' ({mode})")
+
+                if mode == "hybrid":
+                    interval = t.get("interval_seconds", 0)
+                    last_sent = t.get("last_sent_at", 0.0) or 0.0
+                    time_ready = (now - last_sent) >= interval
+                    if new_count >= threshold and time_ready:
+                        ready_tasks.append(t)
+                        cursor.execute("""
+                            UPDATE broadcast_tasks 
+                            SET current_count = 0, last_sent_at = ? 
+                            WHERE id = ?
+                        """, (now, t["id"]))
+                    else:
+                        cursor.execute("""
+                            UPDATE broadcast_tasks 
+                            SET current_count = ? 
+                            WHERE id = ?
+                        """, (new_count, t["id"]))
                 else:
-                    cursor.execute("""
-                        UPDATE broadcast_tasks 
-                        SET current_count = ? 
-                        WHERE id = ?
-                    """, (new_count, t["id"]))
+                    if new_count >= threshold:
+                        ready_tasks.append(t)
+                        cursor.execute("""
+                            UPDATE broadcast_tasks 
+                            SET current_count = 0, last_sent_at = ? 
+                            WHERE id = ?
+                        """, (now, t["id"]))
+                    else:
+                        cursor.execute("""
+                            UPDATE broadcast_tasks 
+                            SET current_count = ? 
+                            WHERE id = ?
+                        """, (new_count, t["id"]))
         return ready_tasks
+
+    def reset_hybrid_task(self, task_id: int):
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE broadcast_tasks SET current_count = 0, last_sent_at = ? WHERE id = ?", (time.time(), task_id))
 
     def update_task_last_sent(self, task_id: int):
         with self._conn() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?", (time.time(), task_id))
+
+    def restore_counter(self, task_id: int, count: int):
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE broadcast_tasks SET current_count = ? WHERE id = ?", (count, task_id))
+
+    def count_tasks_for_template(self, template_name: str, account_id: int = 0) -> int:
+        clean_name = template_name.strip("<>").strip()
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            if account_id:
+                cursor.execute("""
+                    SELECT COUNT(*) as cnt FROM broadcast_tasks 
+                    WHERE (template_name = ? OR template_name = ?) 
+                    AND (account_id = ? OR account_id = 0)
+                """, (clean_name, f"<{clean_name}>", account_id))
+            else:
+                cursor.execute("""
+                    SELECT COUNT(*) as cnt FROM broadcast_tasks 
+                    WHERE (template_name = ? OR template_name = ?)
+                """, (clean_name, f"<{clean_name}>"))
+            row = cursor.fetchone()
+            return row["cnt"] if row else 0
 
     def set_broadcast_status(
         self,
@@ -629,7 +674,7 @@ class Database:
         clean_names = [n.strip("<>").strip() for n in template_names if n.strip("<>").strip()]
         with self._conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM chat_rotations WHERE chat_id = ? AND (account_id = ? OR account_id = 0)", (chat_id, account_id))
+            cursor.execute("SELECT id FROM chat_rotations WHERE chat_id = ? AND (name = '' OR name IS NULL) AND (account_id = ? OR account_id = 0)", (chat_id, account_id))
             row = cursor.fetchone()
             if row:
                 cursor.execute("""
@@ -638,9 +683,93 @@ class Database:
                 """, (json.dumps(clean_names), account_id, row["id"]))
             else:
                 cursor.execute("""
-                    INSERT INTO chat_rotations (account_id, chat_id, template_names, current_index, is_active)
-                    VALUES (?, ?, ?, 0, 1)
+                    INSERT INTO chat_rotations (account_id, chat_id, name, template_names, current_index, is_active)
+                    VALUES (?, ?, '', ?, 0, 1)
                 """, (account_id, chat_id, json.dumps(clean_names)))
+
+    def set_named_rotation(self, name: str, template_names: List[str], chat_id: Optional[int] = None, account_id: int = 0):
+        clean_name = name.strip("<>").strip()
+        clean_names = [n.strip("<>").strip() for n in template_names if n.strip("<>").strip()]
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            if account_id:
+                cursor.execute("SELECT id FROM chat_rotations WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)", (clean_name, f"<{clean_name}>", account_id))
+            else:
+                cursor.execute("SELECT id FROM chat_rotations WHERE name = ? OR name = ?", (clean_name, f"<{clean_name}>"))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute("""
+                    UPDATE chat_rotations SET name = ?, template_names = ?, current_index = 0, is_active = 1, account_id = ?, chat_id = ?
+                    WHERE id = ?
+                """, (clean_name, json.dumps(clean_names), account_id, chat_id, row["id"]))
+            else:
+                cursor.execute("""
+                    INSERT INTO chat_rotations (account_id, chat_id, name, template_names, current_index, is_active)
+                    VALUES (?, ?, ?, ?, 0, 1)
+                """, (account_id, chat_id, clean_name, json.dumps(clean_names)))
+
+    def delete_named_rotation(self, name: str, account_id: int = 0) -> bool:
+        clean_name = name.strip("<>").strip()
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            if account_id:
+                cursor.execute("DELETE FROM chat_rotations WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)", (clean_name, f"<{clean_name}>", account_id))
+                deleted = cursor.rowcount > 0
+                cursor.execute("DELETE FROM broadcast_tasks WHERE (template_name = ? OR template_name = ?) AND (account_id = ? OR account_id = 0)", (clean_name, f"<{clean_name}>", account_id))
+            else:
+                cursor.execute("DELETE FROM chat_rotations WHERE name = ? OR name = ?", (clean_name, f"<{clean_name}>"))
+                deleted = cursor.rowcount > 0
+                cursor.execute("DELETE FROM broadcast_tasks WHERE template_name = ? OR template_name = ?", (clean_name, f"<{clean_name}>"))
+            return deleted
+
+    def get_named_rotation(self, name: str, account_id: int = 0) -> Optional[Dict[str, Any]]:
+        clean_name = name.strip("<>").strip()
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            if account_id:
+                cursor.execute("SELECT * FROM chat_rotations WHERE (name = ? OR name = ?) AND is_active = 1 AND (account_id = ? OR account_id = 0)", (clean_name, f"<{clean_name}>", account_id))
+            else:
+                cursor.execute("SELECT * FROM chat_rotations WHERE (name = ? OR name = ?) AND is_active = 1", (clean_name, f"<{clean_name}>"))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row["id"],
+                "account_id": row["account_id"],
+                "chat_id": row["chat_id"],
+                "name": row["name"],
+                "template_names": json.loads(row["template_names"]) if row["template_names"] else [],
+                "current_index": row["current_index"],
+                "is_active": row["is_active"]
+            }
+
+    def list_named_rotations(self, account_id: int = 0) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            if account_id:
+                cursor.execute("SELECT * FROM chat_rotations WHERE name != '' AND (account_id = ? OR account_id = 0) ORDER BY id ASC", (account_id,))
+            else:
+                cursor.execute("SELECT * FROM chat_rotations WHERE name != '' ORDER BY id ASC")
+            res = []
+            for r in cursor.fetchall():
+                res.append({
+                    "id": r["id"],
+                    "account_id": r["account_id"],
+                    "chat_id": r["chat_id"],
+                    "name": r["name"],
+                    "template_names": json.loads(r["template_names"]) if r["template_names"] else [],
+                    "current_index": r["current_index"],
+                    "is_active": r["is_active"]
+                })
+            return res
+
+    def delete_all_named_rotations(self, account_id: int = 0):
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            if account_id:
+                cursor.execute("DELETE FROM chat_rotations WHERE name != '' AND (account_id = ? OR account_id = 0)", (account_id,))
+            else:
+                cursor.execute("DELETE FROM chat_rotations WHERE name != ''")
 
     def delete_chat_rotation(self, chat_id: Optional[int] = None, chat_ids: Optional[List[int]] = None, account_id: int = 0):
         with self._conn() as conn:
@@ -696,29 +825,42 @@ class Database:
         with self._conn() as conn:
             cursor = conn.cursor()
             if account_id:
-                cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND is_active = 1 AND (account_id = ? OR account_id = 0)", (chat_id, account_id))
+                cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND (name = '' OR name IS NULL) AND is_active = 1 AND (account_id = ? OR account_id = 0)", (chat_id, account_id))
             else:
-                cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND is_active = 1", (chat_id,))
+                cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND (name = '' OR name IS NULL) AND is_active = 1", (chat_id,))
             row = cursor.fetchone()
             if not row:
                 return None
             return {
                 "chat_id": row["chat_id"],
-                "template_names": json.loads(row["template_names"]),
+                "name": row["name"],
+                "template_names": json.loads(row["template_names"]) if row["template_names"] else [],
                 "current_index": row["current_index"],
                 "is_active": row["is_active"]
             }
 
-    def get_next_rotation_template(self, chat_id: int, account_id: int = 0) -> Optional[str]:
+    def get_next_rotation_template(self, chat_id: Optional[int] = None, account_id: int = 0, rotation_name: Optional[str] = None) -> Optional[str]:
         with self._conn() as conn:
             cursor = conn.cursor()
-            if account_id:
-                cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND is_active = 1 AND (account_id = ? OR account_id = 0)", (chat_id, account_id))
-            else:
-                cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND is_active = 1", (chat_id,))
-            row = cursor.fetchone()
+            row = None
+            if rotation_name:
+                clean_rot = rotation_name.strip("<>").strip()
+                if account_id:
+                    cursor.execute("SELECT * FROM chat_rotations WHERE (name = ? OR name = ?) AND is_active = 1 AND (account_id = ? OR account_id = 0)", (clean_rot, f"<{clean_rot}>", account_id))
+                else:
+                    cursor.execute("SELECT * FROM chat_rotations WHERE (name = ? OR name = ?) AND is_active = 1", (clean_rot, f"<{clean_rot}>"))
+                row = cursor.fetchone()
+
+            if not row and chat_id is not None:
+                if account_id:
+                    cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND (name = '' OR name IS NULL) AND is_active = 1 AND (account_id = ? OR account_id = 0)", (chat_id, account_id))
+                else:
+                    cursor.execute("SELECT * FROM chat_rotations WHERE chat_id = ? AND (name = '' OR name IS NULL) AND is_active = 1", (chat_id,))
+                row = cursor.fetchone()
+
             if not row:
                 return None
+
             names = json.loads(row["template_names"]) if row["template_names"] else []
             if not names:
                 return None
@@ -731,7 +873,6 @@ class Database:
                     valid_names.append(clean)
 
             if not valid_names:
-                cursor.execute("DELETE FROM chat_rotations WHERE id = ?", (row["id"],))
                 return None
 
             if len(valid_names) != len(names):
@@ -773,6 +914,7 @@ SPAM_SIGNATURES = [
     r"продам\s+(?:акк[иа]?|аккаунт[ыа]?|сетку|базу|групп[уыа]|бота|клики)",
     r"прода[юе]тся\s+канал[ыа]?",
     r"скупаю\s+(?:канал[ыа]?|акк[иа]?|аккаунт[ыа]?|групп[уыа]|голду|штукенции)",
+    r"(?:купишь|купите|покупайте|покупай)\s+(?:рекламу|канал[ыа]?|акк[иа]?|групп[уыа]|бота)",
     r"без\s+спам\s*блока",
     r"без\s+пароля",
     r"\d+\s*кликов\s*[-–—:]",
@@ -834,8 +976,8 @@ def is_spam_message(text: str, message: Any = None) -> Tuple[bool, str]:
     if message and getattr(message, "via_bot_id", None):
         return True, "sent_via_inline_bot"
 
-    # 0.1 Invisible ghost pings (zero-width spaces used by spammers for mass tagging)
-    if re.search(r"[\u200b-\u200f\u2060-\u206f\ufeff]", text):
+    # 0.1 Invisible ghost pings (zero-width spaces used by spammers for mass tagging, excluding \u200d for composite emojis)
+    if re.search(r"[\u200b\u200c\u200e\u200f\u2060-\u206f\ufeff]", text):
         return True, "invisible_ghost_ping"
 
     # 1. Direct pattern matching from signatures (auto-posting bots, userbots)
@@ -909,8 +1051,8 @@ def is_genuine_buyer_question(text: str) -> bool:
 
     # Conversational questions are short (< 220 chars) and either have ? or clear buyer trigger phrase
     if (has_q_mark or matches_buyer_trigger) and len(clean_text) < 220:
-        # If it's a broadcast offering goods for sale ("Продам каналы"), it's not a buyer asking
-        if re.search(r'\b(?:продам|продаю|скупаю|продажа)\s+(?:канал|акк|сетк|групп|баз|бот)', clean_text):
+        # If it's a broadcast offering goods for sale ("Продам каналы") or asking user to buy ("Купишь рекламу?"), it's not a buyer asking
+        if re.search(r'\b(?:продам|продаю|скупаю|продажа|купишь|купите)\s+(?:канал|акк|сетк|групп|баз|бот|реклам)', clean_text):
             return False
         return True
 
@@ -1075,6 +1217,10 @@ async def send_single_item(
     existing_media = [f for f in media_files if os.path.exists(f)]
     fmt_entities = entities if entities else None
 
+    if not text and not existing_media:
+        log_error("[WARN] Пустой пост: нет текста и медиа-файлы не найдены.")
+        return
+
     if existing_media:
         if len(existing_media) == 1:
             await client.send_file(
@@ -1118,6 +1264,8 @@ async def send_broadcast_post(
                         from_peer=item["forward_chat_id"]
                     )
                     continue
+                except (errors.SlowModeWaitError, errors.FloodWaitError, errors.UserBannedInChannelError, errors.ChannelPrivateError, errors.ChatWriteForbiddenError, asyncio.CancelledError):
+                    raise
                 except Exception as e:
                     print(f"[WARN] Не удалось переслать сообщение: {e}. Отправляю сохраненную копию.")
 
@@ -1151,7 +1299,7 @@ async def get_chats_in_folder(client: TelegramClient, folder_name: str) -> List[
     target_filter = None
 
     for f in getattr(result, "filters", []):
-        if isinstance(f, DialogFilter):
+        if isinstance(f, (DialogFilter, DialogFilterChatlist)):
             title = _extract_folder_title(f).lower()
             if title == target_clean:
                 target_filter = f
@@ -1238,7 +1386,7 @@ async def add_peer_to_folder(client: TelegramClient, folder_name: str, peer: Any
             fid = getattr(f, "id", 0)
             if fid > max_id:
                 max_id = fid
-            if isinstance(f, DialogFilter) and _extract_folder_title(f).lower() == target_clean:
+            if isinstance(f, (DialogFilter, DialogFilterChatlist)) and _extract_folder_title(f).lower() == target_clean:
                 target_filter = f
                 break
 
@@ -1306,15 +1454,38 @@ async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: An
         pass
     try:
         input_chat = await client.get_input_entity(chat_peer)
+        top_id = getattr(getattr(message, "reply_to", None), "reply_to_top_id", None)
+        if top_id:
+            try:
+                await client(ReadMentionsRequest(peer=input_chat, top_msg_id=top_id))
+            except Exception:
+                pass
         await client(ReadMentionsRequest(peer=input_chat))
+    except Exception:
+        pass
+    try:
+        from telethon.tl.functions.messages import ReadReactionsRequest
+        input_chat = await client.get_input_entity(chat_peer)
+        top_id = getattr(getattr(message, "reply_to", None), "reply_to_top_id", None)
+        if top_id:
+            try:
+                await client(ReadReactionsRequest(peer=input_chat, top_msg_id=top_id))
+            except Exception:
+                pass
+        await client(ReadReactionsRequest(peer=input_chat))
     except Exception:
         pass
     try:
         msg_id = getattr(message, "id", 0)
         if msg_id:
-            from telethon.tl.functions.channels import ReadHistoryRequest
             input_chat = await client.get_input_entity(chat_peer)
-            await client(ReadHistoryRequest(channel=input_chat, max_id=msg_id))
+            from telethon.tl.types import InputPeerChannel, InputChannel
+            if isinstance(input_chat, (InputPeerChannel, InputChannel)):
+                from telethon.tl.functions.channels import ReadHistoryRequest as ChannelReadHistoryRequest
+                await client(ChannelReadHistoryRequest(channel=input_chat, max_id=msg_id))
+            else:
+                from telethon.tl.functions.messages import ReadHistoryRequest as MessagesReadHistoryRequest
+                await client(MessagesReadHistoryRequest(peer=input_chat, max_id=msg_id))
     except Exception:
         pass
 
@@ -1345,20 +1516,37 @@ class BroadcasterService:
 
                 tasks = db.get_active_interval_tasks(account_id=self.account_id)
                 for task in tasks:
+                    mode = task.get("mode", "interval")
                     last_sent = task.get("last_sent_at", 0)
                     interval = task.get("interval_seconds", 0)
 
-                    if now - last_sent >= interval:
-                        chat_id = task["chat_id"]
-                        template_name = task["template_name"]
+                    if mode == "hybrid":
+                        current_count = task.get("current_count", 0)
+                        threshold = task.get("counter_threshold", 1)
+                        if (now - last_sent >= interval) and (current_count >= threshold):
+                            chat_id = task["chat_id"]
+                            template_name = task["template_name"]
 
-                        rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id)
-                        effective_name = rotation_tpl if rotation_tpl else template_name
+                            rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
+                            effective_name = rotation_tpl if rotation_tpl else template_name
 
-                        db.update_task_last_sent(task["id"])
-                        await self._send_task(task["id"], chat_id, effective_name, task=task)
-                        # Small delay between different chats in interval batch to avoid flood ban
-                        await asyncio.sleep(1.5)
+                            log_info(f"[HYBRID] Чат {chat_id}: набрано {current_count}/{threshold} соо и прошло {interval}с. Отправляю '{effective_name}'...")
+                            success = await self._send_task(task["id"], chat_id, effective_name, task=task)
+                            if success:
+                                db.reset_hybrid_task(task["id"])
+                            await asyncio.sleep(1.5)
+                    else:
+                        if now - last_sent >= interval:
+                            chat_id = task["chat_id"]
+                            template_name = task["template_name"]
+
+                            rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
+                            effective_name = rotation_tpl if rotation_tpl else template_name
+
+                            db.update_task_last_sent(task["id"])
+                            await self._send_task(task["id"], chat_id, effective_name, task=task)
+                            # Small delay between different chats in interval batch to avoid flood ban
+                            await asyncio.sleep(1.5)
 
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
@@ -1370,11 +1558,14 @@ class BroadcasterService:
         ready_tasks = db.increment_and_check_counter(chat_id, account_id=self.account_id)
         for task in ready_tasks:
             template_name = task["template_name"]
-            rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id)
+            rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
             effective_name = rotation_tpl if rotation_tpl else template_name
 
-            log_info(f"[COUNTER] Чат {chat_id}: набрано {task['counter_threshold']} сообщений. Отправляю пост '{effective_name}'...")
-            await self._send_task(task["id"], chat_id, effective_name, task=task)
+            mode_label = "ГИБРИД" if task.get("mode") == "hybrid" else "СЧЕТЧИК"
+            log_info(f"[{mode_label}] Чат {chat_id}: условие выполнено ({task['counter_threshold']} соо). Отправляю пост '{effective_name}'...")
+            success = await self._send_task(task["id"], chat_id, effective_name, task=task)
+            if not success:
+                db.restore_counter(task["id"], task["counter_threshold"])
 
     async def _send_task(self, task_id: int, chat_id: int, template_name: str, task: Optional[Dict[str, Any]] = None) -> bool:
         template = db.get_template(template_name)
@@ -1383,7 +1574,10 @@ class BroadcasterService:
             return False
 
         try:
-            peer = await self.client.get_input_entity(chat_id)
+            try:
+                peer = await self.client.get_input_entity(chat_id)
+            except Exception:
+                peer = await self.client.get_entity(chat_id)
             await send_broadcast_post(
                 self.client,
                 peer,
@@ -1395,7 +1589,7 @@ class BroadcasterService:
             return True
         except errors.SlowModeWaitError as e:
             log_error(f"[SLOWMODE] Медленный режим в чате {chat_id}: нужно подождать {e.seconds}с")
-            if task and task.get("mode") == "interval":
+            if task and task.get("mode") in ("interval", "hybrid"):
                 try:
                     with db._conn() as conn:
                         conn.execute("UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?", (time.time() - task.get("interval_seconds", 0) + e.seconds + 2, task_id))
@@ -1425,37 +1619,36 @@ HELP_TEXT = """
 • `.рассыл каждые 10 минут <название> "папка"`
 • `.рассыл через 1 <название>`
 • `.рассыл через 3 <название> "папка"`
-• Английские аналоги: `.broadcast every 15s <name>`, `.broadcast after 1 <name>`
+• `.рассыл через 10 соо минимум 10 минут <название>` — **совмещенный (гибридный) режим**: отправка через 10 сообщений, но не чаще раза в 10 минут
+• `.рассыл комби 10 10м <название> "папка"` — краткая форма комбинированного режима
+• Английские аналоги: `.broadcast every 15s <name>`, `.broadcast after 10 <name>`, `.broadcast hybrid 10 10m <name>`
 *(Текст можно писать со 2-й строки или отправить команду в ответ на готовое сообщение)*
 
 **2. Рассылка пересланных сообщений (с каналов / чатов):**
 • `.рассыл-пересланное каждое 15 секунд <название>`
-• `.рассыл-пересланное каждые 10 минут <название> "папка"`
-• `.рассыл-пересланное через 1 <название>`
-• `.рассыл-пересланное через 3 <название> "папка"`
+• `.рассыл-пересланное через 10 соо минимум 10 минут <название>`
 • Английский аналог: `.broadcast-forwarded`
 *(Бот включит сбор: пересылайте любые посты в чат, затем отправьте `.закрыть`)*
 
 **3. Рассылка нескольких сообщений подряд (пачкой):**
+• `.рассыл через 10 10м <название> "папка" -мульти` — быстрый запуск сбора пачки постов
 • `.рассыл-несколько каждое 15 секунд <название>`
-• `.рассыл-несколько каждые 10 минут <название> "папка"`
-• `.рассыл-несколько через 1 <название>`
-• `.рассыл-несколько через 3 <название> "папка"`
+• `.рассыл-несколько через 10 соо минимум 10 минут <название>`
 • Английские аналоги: `.broadcast-multi`, `.broadcast-multiple`
-*(Бот включит сбор: отправляйте любые сообщения, медиа, премиум-эмодзи, затем отправьте `.закрыть`)*
+*(Бот включит сбор: отправляйте любые сообщения, медиа, премиум-эмодзи, затем отправьте `.закончить`)*
 
 **4. Завершение и отмена сбора:**
-• `.закрыть` (или `.close`) — сохранить сообщения и запустить рассылку
+• `.закончить` (или `.закрыть`, `.close`) — сохранить сообщения и запустить рассылку
 • `.отменить` (или `.cancel`) — отменить текущую сессию сбора
 *(Тайм-аут бездействия: 5 минут)*
 
-**5. Чередование постов:**
-• `.чередовать` (со следующей строки названия постов)
-или `.rotate`
-Пример:
-`.чередовать`
-`пост1`
-`пост2`
+**5. Чередование постов (ротации):**
+• `.чередовать <название> <пост1> <пост2>...` — создать именованное чередование
+• `.чередование <название> <пост1> <пост2>...`
+• `.чередования` (или `.ротации`, `.rotations`) — посмотреть все чередования и их порядок
+• `.удалить-чередование <название>` (или `.delete-rotation <name>`) — удалить чередование
+• `.чередовать` (со следующей строки названия постов) — настроить чередование только для текущего чата
+*(Имя чередования можно сразу передавать в `.рассыл`, например: `.рассыл через 10 соо минимум 10 минут связка1 "папка"`)*
 
 **6. Управление статусом:**
 • `.стоп <название>` / `.stop <name>`
@@ -1467,13 +1660,29 @@ HELP_TEXT = """
 • `.удалить все` / `.delete all`
 
 **7. Просмотр и статистика:**
-• `.просмотр <название>` / `.view <name>` — тестовая отправка поста со всеми медиа
-• `.просмотр все` / `.view all` — список всех рассылок в этом чате
+• `.просмотр <название>` / `.view <name>` — тестовая отправка поста со всеми медиа (или проверка чередования)
+• `.просмотр все` / `.view all` — список всех рассылок и чередований в этом чате
 
 **8. Антиспам и авто-подписка:**
 • Моментально гасит спам-пинги и пуши на телефон от скупов и авто-ботов.
 • Автоматически вступает в каналы/боты по требованию капчи админов, мьютит их и убирает в папку `автосабнутое`.
 """
+
+def _extract_collector_flag(text: str) -> Tuple[Optional[str], str]:
+    flag_fwd = re.compile(r'(?:^|\s)(?:--?пересланн\w*|--?fwd|--?forwarded)(?=\s|$)', re.IGNORECASE)
+    flag_multi = re.compile(r'(?:^|\s)(?:--?мульти|--?multi|--?пачк\w*|--?несколько)(?=\s|$)', re.IGNORECASE)
+
+    if flag_fwd.search(text):
+        cleaned = flag_fwd.sub(' ', text).strip()
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        return 'forwarded', cleaned
+
+    if flag_multi.search(text):
+        cleaned = flag_multi.sub(' ', text).strip()
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        return 'multi', cleaned
+
+    return None, text
 
 def _extract_quoted_folder(text: str) -> Tuple[str, str]:
     match = re.search(r'"([^"]+)"', text)
@@ -1482,6 +1691,17 @@ def _extract_quoted_folder(text: str) -> Tuple[str, str]:
         cleaned = text[:match.start()] + text[match.end():]
         return folder, cleaned.strip()
     return "", text.strip()
+
+def _format_seconds(sec: int) -> str:
+    if sec <= 0:
+        return "0с"
+    if sec % 86400 == 0:
+        return f"{sec // 86400} д"
+    if sec % 3600 == 0:
+        return f"{sec // 3600} ч"
+    if sec % 60 == 0:
+        return f"{sec // 60} мин"
+    return f"{sec}с"
 
 def _parse_time_unit(val_str: str, unit_str: Optional[str]) -> Optional[int]:
     val = int(val_str)
@@ -1500,14 +1720,16 @@ def _parse_time_unit(val_str: str, unit_str: Optional[str]) -> Optional[int]:
 
 def _parse_interval_str(s: str) -> Optional[int]:
     clean = s.strip().lower()
-    m = re.match(r"^(\d+)\s*(секунд\w*|сек|с|s|минут\w*|мин|m|час\w*|ч|h|дн\w*|день|д|d)?$", clean)
+    m = re.match(r"^(\d+)\s*(секунд\w*|сек|с|s|минут\w*|мин|м|m|час\w*|ч|h|дн\w*|день|д|d)?$", clean)
     if m:
         return _parse_time_unit(m.group(1), m.group(2))
     return None
 
 def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, str]:
-    folder_name, remaining_first_line = _extract_quoted_folder(first_line)
-    tokens = remaining_first_line.split()
+    _, unflagged_line = _extract_collector_flag(first_line)
+    folder_name, remaining_first_line = _extract_quoted_folder(unflagged_line)
+    text = remaining_first_line.strip()
+    tokens = text.split()
 
     if len(tokens) < 3:
         return "", 0, 0, "", "", "⚠️ Ошибка синтаксиса. Напишите `.инструкция`"
@@ -1517,6 +1739,55 @@ def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, st
     interval_sec = 0
     threshold_count = 0
     template_name = ""
+
+    time_units = r"секунд\w*|сек|с|s|минут\w*|мин|м|m|час\w*|ч|h|дн\w*|день|д|d"
+
+    # Match hybrid/combined broadcast pattern first:
+    # e.g.:
+    # .рассыл через 10 соо минимум 10 минут <название>
+    # .рассыл через 10 соо кд 10м <название>
+    # .рассыл через 10 10м <название>
+    # .рассыл комби 10 10м <название>
+    # .рассыл гибрид 10 10м <название>
+    pattern_hybrid_kw = re.compile(
+        rf"^(?:через|after)\s+(\d+)(?:\s*(?:соо\w*|сообщени\w*|messages?|msg\w*))?"
+        rf"\s+(?:но\s+что\s*бы\s+|но\s+|что\s*бы\s+)?(?:кд|cd|минимум|min|пауза|задержка|от|не\s+чаще)\s*(\d+)\s*({time_units})?"
+        rf"(?:\s+(?:прошло|пройдет|было|истекло))?"
+        rf"\s+(.+)$",
+        re.IGNORECASE
+    )
+    pattern_hybrid_unit = re.compile(
+        rf"^(?:через|after)\s+(\d+)(?:\s*(?:соо\w*|сообщени\w*|messages?|msg\w*))?"
+        rf"\s+(\d+)\s*({time_units})"
+        rf"(?:\s+(?:прошло|пройдет|было|истекло))?"
+        rf"\s+(.+)$",
+        re.IGNORECASE
+    )
+    pattern_hybrid_direct = re.compile(
+        rf"^(?:комби|комбинированное|гибрид|hybrid)\s+(\d+)(?:\s*(?:соо\w*|сообщени\w*|messages?|msg\w*))?"
+        rf"\s+(?:(?:но\s+что\s*бы\s+|но\s+|что\s*бы\s+)?(?:кд|cd|минимум|min|пауза|задержка|от|не\s+чаще)\s*)?(\d+)\s*({time_units})?"
+        rf"(?:\s+(?:прошло|пройдет|было|истекло))?"
+        rf"\s+(.+)$",
+        re.IGNORECASE
+    )
+
+    args_text = " ".join(tokens[1:])
+    m_hyb = pattern_hybrid_kw.match(args_text) or pattern_hybrid_unit.match(args_text) or pattern_hybrid_direct.match(args_text)
+    if m_hyb:
+        count_str, time_str, unit_str, name_part = m_hyb.groups()
+        try:
+            threshold_count = int(count_str)
+        except ValueError:
+            return "", 0, 0, "", "", "⚠️ Число сообщений должно быть числом."
+        interval_sec = _parse_time_unit(time_str, unit_str)
+        if threshold_count <= 0:
+            return "", 0, 0, "", "", "⚠️ Число сообщений должно быть > 0."
+        if not interval_sec or interval_sec <= 0:
+            return "", 0, 0, "", "", "⚠️ Неверно указано минимальное время задержки."
+        template_name = name_part.strip("<>\"'").strip()
+        if not template_name:
+            return "", 0, 0, "", "", "⚠️ Не указано название рассылки."
+        return "hybrid", interval_sec, threshold_count, template_name, folder_name, ""
 
     if sub_cmd in ("каждое", "каждые", "каждый", "every"):
         time_part = tokens[2]
@@ -1544,10 +1815,13 @@ def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, st
             return "", 0, 0, "", "", "⚠️ Число сообщений должно быть > 0."
 
         mode = "counter"
-        if len(tokens) > 3:
-            template_name = tokens[3].strip("<>").strip()
+        name_idx = 3
+        if len(tokens) > 3 and re.match(r"^(?:соо\w*|сообщени\w*|messages?|msg\w*)$", tokens[3], re.IGNORECASE):
+            name_idx = 4
+        if len(tokens) > name_idx:
+            template_name = tokens[name_idx].strip("<>").strip()
     else:
-        return "", 0, 0, "", "", "⚠️ Неизвестный режим рассылки (ожидается: каждое / через)."
+        return "", 0, 0, "", "", "⚠️ Неизвестный режим рассылки (ожидается: каждое / через / комби)."
 
     if not template_name:
         return "", 0, 0, "", "", "⚠️ Не указано название рассылки."
@@ -1560,15 +1834,25 @@ async def _notify(event: Any, text: str, auto_delete: int = 5):
             msg = await event.edit(text)
         else:
             msg = await event.respond(text)
-        if auto_delete > 0:
-            await asyncio.sleep(auto_delete)
-            await msg.delete()
+        if auto_delete > 0 and msg:
+            async def _delayed_delete(target_msg: Any, delay: int):
+                try:
+                    await asyncio.sleep(delay)
+                    await target_msg.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_delayed_delete(msg, auto_delete))
     except Exception:
         try:
             msg = await event.respond(text)
-            if auto_delete > 0:
-                await asyncio.sleep(auto_delete)
-                await msg.delete()
+            if auto_delete > 0 and msg:
+                async def _delayed_delete(target_msg: Any, delay: int):
+                    try:
+                        await asyncio.sleep(delay)
+                        await target_msg.delete()
+                    except Exception:
+                        pass
+                asyncio.create_task(_delayed_delete(msg, auto_delete))
         except Exception as e:
             log_error(f"[ERROR] Ошибка отправки ответа на команду: {e}")
 
@@ -1600,7 +1884,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 except Exception:
                     pass
 
-            if is_relevant_ping and should_auto_read(text, event.message):
+            # Auto-clear if the message is detected as spam, or if it pinged us and matches spam checks
+            if should_auto_read(text, event.message):
+                await clear_spam_mention(client, chat_id, event.message)
+            elif is_relevant_ping and is_spam_message(text, event.message)[0]:
                 await clear_spam_mention(client, chat_id, event.message)
 
         if auto_sub and is_gatekeeper_text(text):
@@ -1650,15 +1937,28 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             session = ACTIVE_COLLECTORS[c_key]
             if time.time() - session.get("last_active", 0) > 300:
                 ACTIVE_COLLECTORS.pop(c_key, None)
-                if raw.strip().lower() in (".закрыть", ".close", "закрыть", "close", ".отменить", ".cancel", "отменить", "cancel"):
+                if raw.strip().lower() in (
+                    ".закрыть", ".close", "закрыть", "close",
+                    ".закончить", ".завершить", "закончить", "завершить",
+                    ".готово", "готово", ".done", "done",
+                    ".отменить", ".cancel", "отменить", "cancel", ".отмена", "отмена"
+                ):
                     await _notify(event, "⚠️ Время ожидания сообщений (5 минут) истекло. Сессия сброшена.")
                     return
             else:
                 low = raw.strip().lower()
-                if low in (".закрыть", ".close", "закрыть", "close"):
+                if low in (
+                    ".закрыть", ".close", "закрыть", "close",
+                    ".закончить", ".завершить", "закончить", "завершить",
+                    ".готово", "готово", ".done", "done",
+                    ".finish", "finish", ".end", "end"
+                ):
                     await finish_collector_session(event, session, c_key)
                     return
-                elif low in (".отменить", ".cancel", "отменить", "cancel"):
+                elif low in (
+                    ".отменить", ".cancel", "отменить", "cancel",
+                    ".отмена", "отмена", ".стоп", "стоп"
+                ):
                     template_name = session["template_name"]
                     target_dir = MEDIA_DIR / re.sub(r'[\\/*?:"<>|]', '_', template_name.strip("<>").strip())
                     if target_dir.exists():
@@ -1667,9 +1967,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     await _notify(event, f"❌ Настройка рассылки **{template_name}** отменена.")
                     return
                 elif raw.startswith(".") and any(raw.lower().startswith(c) for c in (
-                    ".рассыл", ".broadcast", ".чередовать", ".rotate", ".стоп", ".stop",
+                    ".рассыл", ".broadcast", ".чередовать", ".чередование", ".ротация", ".rotate", ".стоп", ".stop",
                     ".продолжить", ".resume", ".удалить", ".delete", ".просмотр", ".view",
-                    ".инструкция", ".help"
+                    ".инструкция", ".help", ".чередования", ".ротации", ".rotations",
+                    ".закончить", ".завершить", ".готово"
                 )):
                     ACTIVE_COLLECTORS.pop(c_key, None)
                 else:
@@ -1703,8 +2004,16 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             await handle_collector_start(event, raw, session_type="multi")
             return
 
-        if cmd in (".чередовать", ".rotate"):
+        if cmd in (".чередовать", ".чередование", ".ротация", ".создать-чередование", ".rotate", ".rotation", ".create-rotation"):
             await handle_rotation_create(event, raw)
+            return
+
+        if cmd in (".удалить-чередование", ".удалить-ротацию", ".delete-rotation"):
+            await handle_delete_rotation(event, parts)
+            return
+
+        if cmd in (".чередования", ".ротации", ".rotations"):
+            await handle_list_rotations(event)
             return
 
         if cmd in (".стоп", ".stop"):
@@ -1787,7 +2096,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             f"📥 **Режим сбора {kind_desc} начат!**\n"
             f"Имя рассылки: **{template_name}**\n"
             f"{action_prompt} в этот чат.{reply_note}\n\n"
-            f"• Напишите `.закрыть` — когда закончите добавление и нужно запустить рассылку.\n"
+            f"• Напишите `.закончить` (или `.закрыть`) — когда закончите добавление и нужно запустить рассылку.\n"
             f"• Напишите `.отменить` — чтобы прервать и сбросить.\n"
             f"⏱ Тайм-аут бездействия: 5 минут.",
             auto_delete=0
@@ -1857,6 +2166,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         items = session["items"]
 
         if not items:
+            clean_name = re.sub(r'[\\/*?:"<>|]', '_', template_name.strip("<>").strip())
+            target_dir = MEDIA_DIR / clean_name
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
             ACTIVE_COLLECTORS.pop(session_key, None)
             await _notify(event, "⚠️ Не было добавлено ни одного сообщения. Сессия закрыта.")
             return
@@ -1897,7 +2210,12 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
         ACTIVE_COLLECTORS.pop(session_key, None)
 
-        details = f"каждые {interval_sec}с" if mode == "interval" else f"через каждые {threshold_count} соо"
+        if mode == "interval":
+            details = f"каждые {_format_seconds(interval_sec)}"
+        elif mode == "hybrid":
+            details = f"через {threshold_count} соо (кд {_format_seconds(interval_sec)})"
+        else:
+            details = f"через каждые {threshold_count} соо"
         target_info = f"в папке \"{folder_name}\" ({len(target_chats)} чатов)" if folder_name else "в этом чате"
         kind_str = "пересланных сообщений" if session["session_type"] == "forwarded" else "сообщений пачкой"
         await _notify(
@@ -1908,6 +2226,13 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         )
 
     async def handle_broadcast_create(event: Any, parts: List[str], raw: str):
+        flag, cleaned_first_line = _extract_collector_flag(raw.splitlines()[0])
+        if flag:
+            other_lines = raw.splitlines()[1:]
+            cleaned_raw = "\n".join([cleaned_first_line] + other_lines)
+            await handle_collector_start(event, cleaned_raw, session_type=flag)
+            return
+
         mode, interval_sec, threshold_count, template_name, folder_name, err = parse_broadcast_params(raw.splitlines()[0])
         if err:
             await _notify(event, err)
@@ -1950,16 +2275,20 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 media_files = await save_media_from_message(client, event.message, template_name, clear_existing=True)
 
         existing = db.get_template(template_name)
+        named_rot = db.get_named_rotation(template_name, account_id=my_id)
         if not text and not media_files:
             if existing:
                 text = existing["text"]
                 entities_hex = existing["entities_hex"]
                 media_files = existing["media_files"]
+            elif named_rot:
+                pass
             else:
                 await _notify(event, "⚠️ Нет текста или медиа. Ответьте командой на сообщение с рекламой или укажите текст со следующей строки.")
                 return
 
-        db.save_template(template_name, text, entities_hex, media_files)
+        if text or media_files:
+            db.save_template(template_name, text, entities_hex, media_files)
 
         target_chats = []
         if folder_name:
@@ -1981,21 +2310,112 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 folder_name=folder_name
             )
 
-        details = f"каждые {interval_sec}с" if mode == "interval" else f"через каждые {threshold_count} соо"
+        if mode == "interval":
+            details = f"каждые {_format_seconds(interval_sec)}"
+        elif mode == "hybrid":
+            details = f"через {threshold_count} соо (кд {_format_seconds(interval_sec)})"
+        else:
+            details = f"через каждые {threshold_count} соо"
+
+        rot_note = f" (чередование **{template_name}**)" if named_rot else ""
         target_info = f"в папке \"{folder_name}\" ({len(target_chats)} чатов)" if folder_name else "в этом чате"
-        await _notify(event, f"✅ Рассылка **{template_name}** запущена ({details}) {target_info}.")
+        await _notify(event, f"✅ Рассылка{rot_note} **{template_name}** запущена ({details}) {target_info}.")
 
     async def handle_rotation_create(event: Any, raw: str):
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        names = lines[1:] if len(lines) > 1 else raw.split()[1:]
-        names = [n.strip("<>").strip() for n in names if n.strip("<>").strip()]
-        if not names:
-            await _notify(event, "⚠️ Укажите названия рассылок для чередования.")
+        first_line = lines[0]
+        cmd_tokens = first_line.split()
+        cmd = cmd_tokens[0].lower()
+
+        if len(lines) > 1:
+            if len(cmd_tokens) > 1:
+                name = cmd_tokens[1].strip("<>:").strip()
+                templates = [l.strip("<>").strip() for l in lines[1:] if l.strip("<>").strip()]
+                if not templates:
+                    await _notify(event, "⚠️ Укажите названия рассылок для чередования со следующих строк.")
+                    return
+                db.set_named_rotation(name, templates, chat_id=event.chat_id, account_id=my_id)
+                joined = " ➔ ".join(templates)
+                await _notify(event, f"✅ Создано чередование **{name}**:\n{joined}\n\nЗапуск: `.рассыл <время/соо> {name}`")
+                return
+            else:
+                templates = [l.strip("<>").strip() for l in lines[1:] if l.strip("<>").strip()]
+                if not templates:
+                    await _notify(event, "⚠️ Укажите названия рассылок для чередования со следующих строк.")
+                    return
+                db.set_chat_rotation(event.chat_id, templates, account_id=my_id)
+                joined = " ➔ ".join(templates)
+                await _notify(event, f"✅ Чередование настроено для этого чата:\n{joined}")
+                return
+        else:
+            args = cmd_tokens[1:]
+            if not args:
+                await _notify(event, "⚠️ Использование:\n• `.чередовать <название> <пост1> <пост2>...`\n• `.чередование <название> <пост1> <пост2>...`\n• `.чередовать` (со следующей строки посты для этого чата)")
+                return
+
+            is_explicit_named_cmd = cmd in (".чередование", ".ротация", ".создать-чередование", ".create-rotation", ".rotation")
+            if is_explicit_named_cmd or len(args) >= 3 or (len(args) == 2 and not (db.get_template(args[0]) and db.get_template(args[1]))):
+                name = args[0].strip("<>:").strip()
+                templates = [n.strip("<>").strip() for n in args[1:] if n.strip("<>").strip()]
+                if not templates:
+                    await _notify(event, f"⚠️ Укажите шаблоны для чередования **{name}**.")
+                    return
+                db.set_named_rotation(name, templates, chat_id=event.chat_id, account_id=my_id)
+                joined = " ➔ ".join(templates)
+                await _notify(event, f"✅ Создано чередование **{name}**:\n{joined}\n\nЗапуск: `.рассыл <время/соо> {name}`")
+            else:
+                templates = [n.strip("<>").strip() for n in args if n.strip("<>").strip()]
+                db.set_chat_rotation(event.chat_id, templates, account_id=my_id)
+                joined = " ➔ ".join(templates)
+                await _notify(event, f"✅ Чередование настроено для этого чата:\n{joined}")
+
+    async def handle_delete_rotation(event: Any, parts: List[str]):
+        if len(parts) < 2:
+            db.delete_chat_rotation(chat_id=event.chat_id, account_id=my_id)
+            await _notify(event, "🗑 Чередование для этого чата удалено.")
             return
 
-        db.set_chat_rotation(event.chat_id, names, account_id=my_id)
-        joined = " ➔ ".join(names)
-        await _notify(event, f"✅ Чередование настроено для чата: {joined}")
+        target_name = parts[1].strip("<>").strip()
+        if target_name.lower() in ("все", "all"):
+            db.delete_all_named_rotations(account_id=my_id)
+            db.delete_chat_rotation(chat_id=event.chat_id, account_id=my_id)
+            await _notify(event, "🗑 Все чередования удалены.")
+            return
+
+        deleted = db.delete_named_rotation(target_name, account_id=my_id)
+        if deleted:
+            await _notify(event, f"🗑 Чередование **{target_name}** удалено.")
+        else:
+            rot = db.get_chat_rotation(event.chat_id, account_id=my_id)
+            if rot:
+                db.delete_chat_rotation(chat_id=event.chat_id, account_id=my_id)
+                await _notify(event, f"🗑 Чередование для этого чата удалено.")
+            else:
+                await _notify(event, f"⚠️ Чередование **{target_name}** не найдено.")
+
+    async def handle_list_rotations(event: Any):
+        named = db.list_named_rotations(account_id=my_id)
+        chat_rot = db.get_chat_rotation(event.chat_id, account_id=my_id)
+
+        if not named and not chat_rot:
+            await _notify(event, "🔄 Нет активных чередований.\nСоздать: `.чередовать <название> <пост1> <пост2>`")
+            return
+
+        lines = ["🔄 **Чередования постов:**\n"]
+        if named:
+            lines.append("**Именованные (для любых чатов/папок):**")
+            for r in named:
+                seq = " ➔ ".join(r["template_names"])
+                curr = r["template_names"][r["current_index"] % len(r["template_names"])] if r["template_names"] else "—"
+                lines.append(f"• **{r['name']}**: {seq} (след: `{curr}`)")
+
+        if chat_rot and chat_rot.get("template_names"):
+            lines.append("\n**Текущий чат:**")
+            seq = " ➔ ".join(chat_rot["template_names"])
+            curr = chat_rot["template_names"][chat_rot["current_index"] % len(chat_rot["template_names"])] if chat_rot["template_names"] else "—"
+            lines.append(f"• {seq} (след: `{curr}`)")
+
+        await _notify(event, "\n".join(lines), auto_delete=20)
 
     async def handle_stop(event: Any, parts: List[str], raw: str):
         folder_name, remaining = _extract_quoted_folder(raw)
@@ -2018,6 +2438,11 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 chat_ids=target_chats if folder_name else None,
                 is_active=0
             )
+        else:
+            named_rot = db.get_named_rotation(target_name, account_id=my_id)
+            if named_rot:
+                with db._conn() as conn:
+                    conn.execute("UPDATE chat_rotations SET is_active = 0 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)", (target_name, f"<{target_name}>", my_id))
         folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
         await _notify(event, f"⏹ Остановлено рассылок: {count}{folder_str}")
 
@@ -2042,6 +2467,11 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 chat_ids=target_chats if folder_name else None,
                 is_active=1
             )
+        else:
+            named_rot = db.get_named_rotation(target_name, account_id=my_id)
+            if named_rot:
+                with db._conn() as conn:
+                    conn.execute("UPDATE chat_rotations SET is_active = 1 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)", (target_name, f"<{target_name}>", my_id))
         folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
         await _notify(event, f"▶️ Возобновлено рассылок: {count}{folder_str}")
 
@@ -2063,10 +2493,15 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 for tpl in db.list_templates():
                     db.delete_template(tpl["name"])
                 db.delete_chat_rotation(chat_id=event.chat_id, account_id=my_id)
+                db.delete_all_named_rotations(account_id=my_id)
             else:
                 db.delete_chat_rotation(chat_ids=target_chats, account_id=my_id)
         else:
-            db.delete_template(target_name)
+            if not folder_name:
+                remaining_tasks = db.count_tasks_for_template(target_name, account_id=my_id)
+                if remaining_tasks == 0:
+                    db.delete_template(target_name)
+                    db.delete_named_rotation(target_name, account_id=my_id)
 
         folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
         await _notify(event, f"🗑 Удалено рассылок: {count}{folder_str}")
@@ -2086,17 +2521,51 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             lines = ["**📋 Рассылки в этом чате:**\n"]
             for t in tasks:
                 status = "🟢 Вкл" if t["is_active"] else "🔴 Выкл"
-                mode_str = f"каждые {t['interval_seconds']}с" if t["mode"] == "interval" else f"через {t['counter_threshold']} соо"
+                if t["mode"] == "interval":
+                    mode_str = f"каждые {_format_seconds(t['interval_seconds'])}"
+                elif t["mode"] == "hybrid":
+                    mode_str = f"через {t['counter_threshold']} соо (кд {_format_seconds(t['interval_seconds'])})"
+                else:
+                    mode_str = f"через {t['counter_threshold']} соо"
                 folder_str = f" (папка: {t['folder_name']})" if t["folder_name"] else ""
-                lines.append(f"• **{t['template_name']}** — {status} | {mode_str}{folder_str}")
+
+                named_rot = db.get_named_rotation(t["template_name"], account_id=my_id)
+                rot_info = f" [чередование: {' ➔ '.join(named_rot['template_names'])}]" if named_rot else ""
+                lines.append(f"• **{t['template_name']}**{rot_info} — {status} | {mode_str}{folder_str}")
 
             rot = db.get_chat_rotation(event.chat_id, account_id=my_id)
-            if rot:
+            if rot and rot.get("template_names"):
                 seq = " ➔ ".join(rot["template_names"])
-                lines.append(f"\n🔄 **Очередь чередования:** {seq}")
+                lines.append(f"\n🔄 **Очередь чередования этого чата:** {seq}")
 
-            await _notify(event, "\n".join(lines), auto_delete=15)
+            named_rots = db.list_named_rotations(account_id=my_id)
+            if named_rots:
+                lines.append("\n🔄 **Все сохраненные чередования:**")
+                for nr in named_rots:
+                    seq = " ➔ ".join(nr["template_names"])
+                    lines.append(f"• **{nr['name']}**: {seq}")
+
+            await _notify(event, "\n".join(lines), auto_delete=20)
         else:
+            named_rot = db.get_named_rotation(target, account_id=my_id)
+            if named_rot:
+                tpls = named_rot["template_names"]
+                seq = " ➔ ".join(tpls)
+                next_tpl = db.get_next_rotation_template(account_id=my_id, rotation_name=target)
+                await _notify(event, f"🔄 Чередование **{target}**: {seq}\n👁 Тестовый предпросмотр: **{next_tpl}** (отправляю ниже)", auto_delete=5)
+                if next_tpl:
+                    tpl_data = db.get_template(next_tpl)
+                    if tpl_data:
+                        await send_broadcast_post(
+                            client,
+                            event.chat_id,
+                            text=tpl_data["text"],
+                            entities_hex=tpl_data["entities_hex"],
+                            media_files=tpl_data["media_files"],
+                            bundle=tpl_data.get("bundle")
+                        )
+                return
+
             tpl = db.get_template(target)
             if not tpl:
                 await _notify(event, f"⚠️ Рассылка с именем **{target}** не найдена.")
