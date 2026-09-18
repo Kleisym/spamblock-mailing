@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Spambuster</string>
+    <string name="channel_id">spambuster_service_channel</string>
+    <string name="channel_name">Spambuster Background Service</string>
+    <string name="channel_desc">Telegram userbot and antispam 24/7 background worker</string>
+    <string name="service_running_title">Spambuster активен (24/7)</string>
+    <string name="service_running_content">Защита от спама и авто-рассылки работают в фоне</string>
+</resources>
