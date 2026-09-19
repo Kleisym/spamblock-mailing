@@ -34,7 +34,6 @@ class SpambusterService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        acquireWakeLock()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -142,14 +141,18 @@ class SpambusterService : Service() {
         }
     }
 
-    private fun acquireWakeLock() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "Spambuster::ForegroundWakeLock"
-        ).apply {
-            setReferenceCounted(false)
-            acquire()
+    fun acquireTemporaryWakeLock(timeoutMs: Long = 30000L) {
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "Spambuster::TempWakeLock"
+            ).apply {
+                setReferenceCounted(false)
+                acquire(timeoutMs)
+            }
+        } catch (e: Exception) {
+            // ignore
         }
     }
 

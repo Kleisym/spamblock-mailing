@@ -264,6 +264,9 @@ class Database:
             cursor = conn.cursor()
             try:
                 cursor.execute("PRAGMA journal_mode=WAL;")
+                cursor.execute("PRAGMA synchronous=NORMAL;")
+                cursor.execute("PRAGMA temp_store=MEMORY;")
+                cursor.execute("PRAGMA cache_size=-2000;")
             except Exception:
                 pass
             cursor.execute("""
@@ -300,6 +303,9 @@ class Database:
                     UNIQUE(account_id, chat_id, template_name)
                 )
             """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_broadcast_tasks_chat ON broadcast_tasks (chat_id, is_active, mode);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_broadcast_tasks_active ON broadcast_tasks (is_active, mode, account_id);")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS chat_rotations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -904,17 +910,24 @@ SPAM_SIGNATURES = [
     r"(?:пишите|писать|связь|обращаться|отпишите)\s+(?:в\s+лс|в\s+личку|менеджеру|сюда)?\s*[:\-—]?\s*@\w+",
     r"(?:по\s+поводу\s+(?:рекламы|покупки|сотрудничества)|для\s+заказа)\s*[:\-—]?\s*@\w+",
     r"(?:наш\s+(?:канал|чат|бот|шоп|магазин)|вход\s+в\s+чат)\s*[:\-—]?\s*(?:https?://)?t\.me/\+?[a-zA-Z0-9_]+",
+    r"(?:📩|👉|📲|💬|✍️|✉️)\s*(?:в\s+лс|пишите|связь|обращаться)?\s*@\w+",
 
-    # 4. Catalog bullet points with @ channels or links
+    # 4. Recruitment and manager ads
+    r"ищу\s+менеджер\w*",
+    r"менеджер\w*\s+по\s+продажам",
+    r"в\s+(?:мой|наш)\s+канал\s*[:\-—]?\s*@\w+",
+
+    # 5. Catalog bullet points with @ channels or links
     r"[1-9]️⃣\s*@\w+",
     r"[①-⑩]\s*@\w+",
 
-    # 5. Product/service selling
-    r"продам\s+канал[ыа]?",
+    # 6. Product/service selling
+    r"продам\s+(?:канал[ыа]?|чат[ыа]?)",
     r"продам\s+(?:акк[иа]?|аккаунт[ыа]?|сетку|базу|групп[уыа]|бота|клики)",
-    r"прода[юе]тся\s+канал[ыа]?",
+    r"прода[юе]тся\s+(?:канал[ыа]?|чат[ыа]?)",
+    r"(?:эро|азартн\w*|казино|крипт\w*|гемблинг)\s+тематик\w*",
     r"скупаю\s+(?:канал[ыа]?|акк[иа]?|аккаунт[ыа]?|групп[уыа]|голду|штукенции)",
-    r"(?:купишь|купите|покупайте|покупай)\s+(?:рекламу|канал[ыа]?|акк[иа]?|групп[уыа]|бота)",
+    r"(?:купишь|купите|покупайте|покупай)\s+(?:рекламу|канал[ыа]?|чат[ыа]?|акк[иа]?|групп[уыа]|бота)",
     r"без\s+спам\s*блока",
     r"без\s+пароля",
     r"\d+\s*кликов\s*[-–—:]",
@@ -966,59 +979,209 @@ VERIFY_BUTTON_TEXTS = [
     "вступил", "продолжить", "check", "done", "verify", "i subscribed"
 ]
 
+def _utf16_slice(text: str, offset: int, length: int) -> str:
+    try:
+        encoded = text.encode("utf-16-le")
+        return encoded[offset * 2 : (offset + length) * 2].decode("utf-16-le", errors="ignore")
+    except Exception:
+        return text[offset : offset + length]
+
+def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List[str]]:
+    """
+    Advanced Heuristic Spam Recognition Engine.
+    Evaluates message structure, layout typography, entity metadata,
+    routing CTAs, and conversational dampeners.
+    
+    Returns (score, primary_trigger, matched_factors).
+    Threshold for spam classification is score >= 50.
+    """
+    if not text:
+        return 0, "", []
+
+    factors: List[str] = []
+    clean_text = text.lower()
+    raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
+    clean_lines = [l.strip() for l in clean_text.splitlines() if l.strip()]
+
+    # =========================================================================
+    # 1. HARD TRIGGERS (Immediate 100 points)
+    # =========================================================================
+    # 1.1 Inline posting bot watermark / auto-poster
+    if message and getattr(message, "via_bot_id", None):
+        return 100, "sent_via_inline_bot", ["inline_bot"]
+
+    # 1.2 Invisible ghost ping characters (zero-width characters used for hidden mass-tagging)
+    if re.search(r"[\u200b\u200c\u200e\u200f\u2060-\u206f\ufeff]", text):
+        return 100, "invisible_ghost_ping", ["zero_width_ghost_chars"]
+
+    # 1.3 Entity inspection: hidden ghost mentions & mass tagging
+    if message and getattr(message, "entities", None):
+        from telethon.tl.types import (
+            MessageEntityMentionName,
+            MessageEntityMention,
+            MessageEntityTextUrl
+        )
+        mention_names = 0
+        text_urls_user = 0
+        total_mentions = 0
+        has_hidden_mention = False
+
+        for ent in message.entities:
+            if isinstance(ent, MessageEntityMentionName):
+                mention_names += 1
+                total_mentions += 1
+                try:
+                    ent_text = _utf16_slice(text, ent.offset, ent.length)
+                    if not ent_text.strip() or not re.search(r'\w', ent_text):
+                        has_hidden_mention = True
+                except Exception:
+                    has_hidden_mention = True
+            elif isinstance(ent, MessageEntityMention):
+                total_mentions += 1
+            elif isinstance(ent, MessageEntityTextUrl):
+                if ent.url and "tg://user?id=" in ent.url.lower():
+                    text_urls_user += 1
+                    total_mentions += 1
+                    try:
+                        ent_text = _utf16_slice(text, ent.offset, ent.length)
+                        if not ent_text.strip() or not re.search(r'\w', ent_text):
+                            has_hidden_mention = True
+                    except Exception:
+                        has_hidden_mention = True
+
+        if mention_names >= 2 or text_urls_user >= 2 or total_mentions >= 3:
+            return 100, "mass_entity_tagging", [f"mentions_{total_mentions}"]
+
+        if has_hidden_mention:
+            return 100, "hidden_ghost_mention", ["mention_under_emoji_or_space"]
+
+    # 1.4 Direct signature matching (watermarks, spam tools, seller solicitations)
+    for pat in SPAM_PATTERNS:
+        if pat.search(clean_text):
+            return 100, pat.pattern, ["signature_match"]
+
+    # =========================================================================
+    # 2. HEURISTIC ACCUMULATIVE SCORING
+    # =========================================================================
+    score = 0
+
+    # 2.1 Layout & Visual Structure
+    # Banner / promo emojis at line starts (🔥, ⚡️, 📢, 💎, 💰, 🚀, 🚨, ❗️, ⚠️, ⭐️, 1️⃣, 2️⃣)
+    banner_emoji_lines = sum(
+        1 for l in raw_lines
+        if re.match(r"^(?:🔥|⚡️|📢|💎|💰|🚀|🚨|❗️|⚠️|⭐️|🌟|💥|🎯|👉|📩|📲|💬)", l)
+    )
+    if banner_emoji_lines >= 1:
+        pts = 15 if banner_emoji_lines == 1 else 25
+        score += pts
+        factors.append(f"banner_emojis(+{pts})")
+
+    # Itemized catalog bullet points (·, •, -, —, 1️⃣, 2️⃣, ①, ②)
+    bullet_lines = sum(
+        1 for l in raw_lines
+        if re.match(r"^(?:[·•\-\—\*]|\d+[\.\)\-\—]|[1-9]️⃣|[①-⑩])\s*", l)
+    )
+    if bullet_lines >= 1:
+        pts = 15 if bullet_lines == 1 else 25
+        score += pts
+        factors.append(f"bullet_points(+{pts})")
+
+    # Multi-block layout (structured advertisement with multiple separated sections)
+    if len(raw_lines) >= 3 or ("\n\n" in text and len(raw_lines) >= 2):
+        score += 15
+        factors.append("multiblock_layout(+15)")
+
+    # 2.2 Contacts, Routing & CTA (Call to Action)
+    # Contact block directed via emoji (e.g. 📩@SuKoW, 👉@user, 👉Пишите в лс @user)
+    has_emoji_contact = bool(re.search(
+        r'(?:📩|👉|📲|💬|✍️|✉️)\s*(?:в\s+лс|пишите|связь|обращаться)?\s*@\w+',
+        clean_text
+    ))
+    if has_emoji_contact:
+        score += 30
+        factors.append("emoji_contact_routing(+30)")
+
+    # Textual seller routing (пишите в лс @..., связь @...)
+    has_text_seller_contact = bool(re.search(
+        r'(?:пишите|писать|связь|обращаться|отпишите|в\s+лс|в\s+личку|менеджеру)\s*[:\-—]?\s*@\w+',
+        clean_text
+    ))
+    if has_text_seller_contact and not has_emoji_contact:
+        score += 25
+        factors.append("text_seller_routing(+25)")
+
+    # Channel links (t.me/+, joinchat, or t.me/username)
+    promo_links = re.findall(r't\.me/(?:\+|joinchat/|[a-zA-Z0-9_]{5,})', clean_text)
+    if promo_links:
+        pts = 25 if any("+" in link or "joinchat" in link for link in promo_links) else 15
+        score += pts
+        factors.append(f"promo_links(+{pts})")
+
+    # Multiple mentions / channel handles (@channel, @manager)
+    usernames = re.findall(r'@([a-zA-Z0-9_]{4,32})', text)
+    if len(usernames) >= 2:
+        score += 15
+        factors.append(f"multiple_usernames_{len(usernames)}(+15)")
+
+    # 2.3 Commercial Intent & Asset Description
+    # Commercial offer/recruitment pitch (продам канал, продам чат, ищу менеджеров по продажам)
+    has_commercial_pitch = bool(re.search(
+        r'\b(?:продам|продаю|прода[её]тся|скупаю|продажа|ищу\s+менеджер\w*|менеджер\w*\s+по\s+продажам)\b',
+        clean_text
+    ))
+    if has_commercial_pitch:
+        score += 25
+        factors.append("commercial_pitch(+25)")
+
+    # Asset specifiers (канал, чат, эро тематики, азартной тематики, казино, гемблинг, аккаунты, клики)
+    has_asset_specifiers = bool(re.search(
+        r'\b(?:канал[ыа]?|чат[ыа]?|сетку|базу|аккаунт[ыа]?|клики|тематик\w*|казино|гемблинг|азарт)\b',
+        clean_text
+    ))
+    if has_asset_specifiers:
+        score += 15
+        factors.append("asset_specifiers(+15)")
+
+    # Mass account lists with country flags
+    flag_count = sum(1 for flag in COUNTRY_FLAGS if flag in text)
+    if flag_count >= 3:
+        score += 35
+        factors.append(f"country_flags_{flag_count}(+35)")
+
+    # =========================================================================
+    # 3. CONVERSATIONAL DAMPENERS (Protects regular users)
+    # =========================================================================
+    # Question mark without commercial routing indicates genuine inquiry
+    has_q_mark = "?" in clean_text
+    if has_q_mark and not (has_emoji_contact or has_text_seller_contact):
+        score -= 30
+        factors.append("question_mark(-30)")
+
+    # Short single-line conversational messages (< 70 chars)
+    if len(clean_text) < 70 and len(raw_lines) == 1:
+        score -= 30
+        factors.append("short_single_line(-30)")
+
+    # Conversational speech markers (я, мне, мы, ты, тебе, привет, спасибо, ку, хаха, лол)
+    conversational_markers = bool(re.search(
+        r'\b(?:я|мне|меня|мы|нас|ты|тебе|тебя|привет|ку|здравствуйте|спасибо|спс|лол|хах|хд|ладно|норм|почему|зачем)\b',
+        clean_text
+    ))
+    if conversational_markers and not (has_emoji_contact or bullet_lines >= 1):
+        score -= 20
+        factors.append("conversational_markers(-20)")
+
+    # Determine primary trigger
+    primary_trigger = factors[0] if factors else "low_score"
+    return max(0, score), primary_trigger, factors
+
 def is_spam_message(text: str, message: Any = None) -> Tuple[bool, str]:
     if not text:
         return False, ""
-    clean_text = text.lower()
-    lines = [l.strip() for l in clean_text.splitlines() if l.strip()]
 
-    # 0. Messages sent via inline bot (auto-posters, formatted bots)
-    if message and getattr(message, "via_bot_id", None):
-        return True, "sent_via_inline_bot"
-
-    # 0.1 Invisible ghost pings (zero-width spaces used by spammers for mass tagging, excluding \u200d for composite emojis)
-    if re.search(r"[\u200b\u200c\u200e\u200f\u2060-\u206f\ufeff]", text):
-        return True, "invisible_ghost_ping"
-
-    # 1. Direct pattern matching from signatures (auto-posting bots, userbots)
-    for pat in SPAM_PATTERNS:
-        if pat.search(clean_text):
-            return True, pat.pattern
-
-    # 2. Country flags in mass account lists
-    flag_count = sum(1 for flag in COUNTRY_FLAGS if flag in text)
-    if flag_count >= 3 and ("⭐️" in text or "🌟" in text or "аккаунт" in clean_text):
-        return True, "mass_account_price_list"
-
-    # 3. Seller contact routing (directing traffic to DM, manager, bot)
-    has_seller_contact = bool(re.search(r'(?:пишите|писать|связь|обращаться|отпишите|в\s+лс|лс)\s*[:\-—]?\s*@\w+', clean_text))
-
-    # 4. Numbered list / catalog items (1️⃣, 2️⃣, 3️⃣...)
-    has_numbered_list = bool(re.search(r'[1-9]️⃣|[①-⑩]|\b1\s*[\)\.\-—]\s*@|\b2\s*[\)\.\-—]\s*@', clean_text))
-
-    # 5. Promo links (t.me/+, joinchat, or channel usernames)
-    promo_links = re.findall(r't\.me/(?:\+|joinchat/|[a-zA-Z0-9_]{5,})', clean_text)
-    has_promo_links = len(promo_links) >= 1
-
-    # 6. Commercial sale/service keywords
-    has_sale_keywords = bool(re.search(r'\b(?:продам|продаю|прода[её]тся|скупаю|продажа|покупка|услуги|клики|аккаунты|накрутка|казино|гемблинг|азарт)\b', clean_text))
-
-    # Structured promo post (like Malone's: lists of channels/items + seller contact or sales pitch)
-    if (has_numbered_list or has_promo_links) and (has_seller_contact or has_sale_keywords):
-        return True, "structured_promo_post"
-
-    if has_sale_keywords and has_seller_contact:
-        return True, "sale_with_seller_contact"
-
-    # Multi-line formatted price list / matrix
-    price_lines = sum(1 for l in lines if any(s in l for s in ("-", "—", "–", ":", "$", "₽", "🌟", "⭐️", "руб")) and len(l) < 50)
-    if len(lines) >= 3 and price_lines >= 2 and has_sale_keywords:
-        return True, "price_list_matrix"
-
-    # Long commercial broadcast with multiple mentions/links
-    if len(lines) >= 3 and has_sale_keywords and (len(re.findall(r'[@#]', clean_text)) >= 2 or has_promo_links):
-        return True, "multiline_ad_catalog"
-
+    score, primary_trigger, factors = calculate_spam_score(text, message)
+    if score >= 50:
+        return True, f"{primary_trigger} (score={score})"
     return False, ""
 
 def is_genuine_buyer_question(text: str) -> bool:
@@ -1027,7 +1190,7 @@ def is_genuine_buyer_question(text: str) -> bool:
     clean_text = text.lower().strip()
 
     # Never consider a message a buyer question if it contains seller contact directing to another username
-    if re.search(r'(?:пишите|писать|связь|обращаться|отпишите)\s*[:\-—]?\s*@\w+', clean_text):
+    if re.search(r'(?:пишите|писать|связь|обращаться|отпишите)\s*[:\-—]?\s*@\w+|(?:📩|👉|📲|💬|✍️|✉️)\s*@\w+', clean_text):
         return False
 
     # Never consider catalog/product lists as buyer questions
@@ -1052,7 +1215,7 @@ def is_genuine_buyer_question(text: str) -> bool:
     # Conversational questions are short (< 220 chars) and either have ? or clear buyer trigger phrase
     if (has_q_mark or matches_buyer_trigger) and len(clean_text) < 220:
         # If it's a broadcast offering goods for sale ("Продам каналы") or asking user to buy ("Купишь рекламу?"), it's not a buyer asking
-        if re.search(r'\b(?:продам|продаю|скупаю|продажа|купишь|купите)\s+(?:канал|акк|сетк|групп|баз|бот|реклам)', clean_text):
+        if re.search(r'\b(?:продам|продаю|скупаю|продажа|купишь|купите)\s+(?:канал|чат|акк|сетк|групп|баз|бот|реклам)', clean_text):
             return False
         return True
 
@@ -1448,44 +1611,76 @@ async def join_and_silence_target(
     return False
 
 async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: Any):
-    try:
-        await client.send_read_acknowledge(chat_peer, message=message, clear_mentions=True)
-    except Exception:
-        pass
-    try:
-        input_chat = await client.get_input_entity(chat_peer)
-        top_id = getattr(getattr(message, "reply_to", None), "reply_to_top_id", None)
-        if top_id:
+    input_peer = None
+    from telethon.tl.types import (
+        TypeInputPeer,
+        InputPeerChannel,
+        InputPeerChat,
+        InputPeerUser,
+        InputChannel,
+    )
+    if isinstance(chat_peer, (TypeInputPeer, InputPeerChannel, InputPeerChat, InputPeerUser)):
+        input_peer = chat_peer
+    elif hasattr(message, "get_input_chat"):
+        try:
+            input_peer = await message.get_input_chat()
+        except Exception:
+            pass
+    if not input_peer and hasattr(message, "input_chat"):
+        input_peer = message.input_chat
+    if not input_peer:
+        try:
+            input_peer = await client.get_input_entity(chat_peer)
+        except Exception:
             try:
-                await client(ReadMentionsRequest(peer=input_chat, top_msg_id=top_id))
+                input_peer = await client.get_entity(chat_peer)
             except Exception:
                 pass
-        await client(ReadMentionsRequest(peer=input_chat))
+    if not input_peer:
+        return
+
+    msg_id = getattr(message, "id", 0)
+
+    # Forum topic detection (support both reply_to_top_id and reply_to_msg_id when forum_topic is true)
+    reply_to = getattr(message, "reply_to", None)
+    top_id = getattr(reply_to, "reply_to_top_id", None)
+    if not top_id and getattr(reply_to, "forum_topic", False):
+        top_id = getattr(reply_to, "reply_to_msg_id", None)
+
+    # 1. Clear mentions
+    try:
+        if top_id:
+            await client(ReadMentionsRequest(peer=input_peer, top_msg_id=top_id))
+        await client(ReadMentionsRequest(peer=input_peer))
     except Exception:
         pass
+
+    # 2. Clear reactions
     try:
         from telethon.tl.functions.messages import ReadReactionsRequest
-        input_chat = await client.get_input_entity(chat_peer)
-        top_id = getattr(getattr(message, "reply_to", None), "reply_to_top_id", None)
         if top_id:
-            try:
-                await client(ReadReactionsRequest(peer=input_chat, top_msg_id=top_id))
-            except Exception:
-                pass
-        await client(ReadReactionsRequest(peer=input_chat))
+            await client(ReadReactionsRequest(peer=input_peer, top_msg_id=top_id))
+        await client(ReadReactionsRequest(peer=input_peer))
     except Exception:
         pass
-    try:
-        msg_id = getattr(message, "id", 0)
-        if msg_id:
-            input_chat = await client.get_input_entity(chat_peer)
-            from telethon.tl.types import InputPeerChannel, InputChannel
-            if isinstance(input_chat, (InputPeerChannel, InputChannel)):
+
+    # 3. Mark read history
+    if msg_id:
+        try:
+            from telethon import utils
+            if isinstance(input_peer, (InputPeerChannel, InputChannel)):
+                input_chan = utils.get_input_channel(input_peer)
                 from telethon.tl.functions.channels import ReadHistoryRequest as ChannelReadHistoryRequest
-                await client(ChannelReadHistoryRequest(channel=input_chat, max_id=msg_id))
+                await client(ChannelReadHistoryRequest(channel=input_chan, max_id=msg_id))
             else:
                 from telethon.tl.functions.messages import ReadHistoryRequest as MessagesReadHistoryRequest
-                await client(MessagesReadHistoryRequest(peer=input_chat, max_id=msg_id))
+                await client(MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id))
+        except Exception:
+            pass
+
+    # 4. High-level acknowledge with mention and reaction clearing
+    try:
+        await client.send_read_acknowledge(input_peer, max_id=msg_id, clear_mentions=True, clear_reactions=True)
     except Exception:
         pass
 
@@ -1507,12 +1702,25 @@ class BroadcasterService:
             self._task.cancel()
 
     async def _loop(self):
+        import gc
+        last_gc = time.time()
+        last_collector_clean = time.time()
+
         while self.is_running:
             try:
                 now = time.time()
-                expired = [k for k, s in ACTIVE_COLLECTORS.items() if now - s.get("last_active", 0) > 300]
-                for k in expired:
-                    ACTIVE_COLLECTORS.pop(k, None)
+
+                # Clean expired collector sessions every 30s instead of every second
+                if now - last_collector_clean > 30:
+                    expired = [k for k, s in ACTIVE_COLLECTORS.items() if now - s.get("last_active", 0) > 300]
+                    for k in expired:
+                        ACTIVE_COLLECTORS.pop(k, None)
+                    last_collector_clean = now
+
+                # Periodic memory cleanup for mobile (every 10 minutes)
+                if now - last_gc > 600:
+                    gc.collect()
+                    last_gc = now
 
                 tasks = db.get_active_interval_tasks(account_id=self.account_id)
                 for task in tasks:
@@ -1548,11 +1756,28 @@ class BroadcasterService:
                             # Small delay between different chats in interval batch to avoid flood ban
                             await asyncio.sleep(1.5)
 
-                await asyncio.sleep(1)
+                # Dynamic sleep to prevent CPU/battery drain on phone:
+                # If there are no interval/hybrid tasks, sleep 5.0 seconds.
+                # If tasks exist, sleep dynamically up to 5.0 seconds based on when the next task is due.
+                if not tasks:
+                    await asyncio.sleep(5.0)
+                else:
+                    min_wait = 5.0
+                    for task in tasks:
+                        interval = task.get("interval_seconds", 0)
+                        last_sent = task.get("last_sent_at", 0)
+                        time_left = interval - (time.time() - last_sent)
+                        if time_left <= 0:
+                            min_wait = 1.0
+                            break
+                        else:
+                            min_wait = min(min_wait, time_left)
+                    await asyncio.sleep(max(1.0, min(min_wait, 5.0)))
+
             except asyncio.CancelledError:
                 break
             except Exception:
-                await asyncio.sleep(2)
+                await asyncio.sleep(3.0)
 
     async def handle_counter_event(self, chat_id: int):
         ready_tasks = db.increment_and_check_counter(chat_id, account_id=self.account_id)
@@ -1885,10 +2110,11 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     pass
 
             # Auto-clear if the message is detected as spam, or if it pinged us and matches spam checks
+            target_peer = getattr(event, "input_chat", None) or chat_id
             if should_auto_read(text, event.message):
-                await clear_spam_mention(client, chat_id, event.message)
+                await clear_spam_mention(client, target_peer, event.message)
             elif is_relevant_ping and is_spam_message(text, event.message)[0]:
-                await clear_spam_mention(client, chat_id, event.message)
+                await clear_spam_mention(client, target_peer, event.message)
 
         if auto_sub and is_gatekeeper_text(text):
             is_targeted = event.mentioned
