@@ -20,7 +20,6 @@ import kotlin.concurrent.thread
 class SpambusterService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
-    private var pythonThread: Thread? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
@@ -29,6 +28,10 @@ class SpambusterService : Service() {
         const val ACTION_STOP = "com.spambuster.app.ACTION_STOP"
         const val PREFS_NAME = "spambuster_prefs"
         const val KEY_SERVICE_ENABLED = "service_enabled"
+
+        @Volatile
+        var activePythonThread: Thread? = null
+        val threadLock = Any()
     }
 
     override fun onCreate() {
@@ -54,78 +57,86 @@ class SpambusterService : Service() {
     }
 
     private fun startPythonBot() {
-        if (pythonThread != null && pythonThread?.isAlive == true) {
-            return
-        }
+        synchronized(threadLock) {
+            if (activePythonThread != null && activePythonThread?.isAlive == true) {
+                return
+            }
 
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val apiId = prefs.getString("api_id", "") ?: ""
-        val apiHash = prefs.getString("api_hash", "") ?: ""
-        val phone = prefs.getString("phone", "") ?: ""
-        val password2FA = prefs.getString("password_2fa", "") ?: ""
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val apiId = prefs.getString("api_id", "") ?: ""
+            val apiHash = prefs.getString("api_hash", "") ?: ""
+            val phone = prefs.getString("phone", "") ?: ""
+            val password2FA = prefs.getString("password_2fa", "") ?: ""
 
-        if (apiId.isEmpty() || apiHash.isEmpty()) {
-            updateStatusAndNotification("Ошибка: API ID или Hash не заполнены", false)
-            return
-        }
+            if (apiId.isEmpty() || apiHash.isEmpty()) {
+                updateStatusAndNotification("Ошибка: API ID или Hash не заполнены", false)
+                return
+            }
 
-        pythonThread = thread(name = "Spambuster-Python-Thread") {
-            try {
-                if (!Python.isStarted()) {
-                    Python.start(AndroidPlatform(this@SpambusterService))
-                }
-                val py = Python.getInstance()
-                val bridge = py.getModule("bot_bridge")
+            activePythonThread = thread(name = "Spambuster-Python-Thread") {
+                try {
+                    if (!Python.isStarted()) {
+                        Python.start(AndroidPlatform(this@SpambusterService))
+                    }
+                    val py = Python.getInstance()
+                    val bridge = py.getModule("bot_bridge")
 
-                val callback = object {
-                    fun requestCode(): String {
-                        updateStatusAndNotification("Требуется код подтверждения Telegram!", true)
-                        mainHandler.post {
-                            BotBridgeCoordinator.uiListener?.onCodeRequested()
+                    val callback = object {
+                        fun requestCode(): String {
+                            updateStatusAndNotification("Требуется код подтверждения Telegram!", true)
+                            mainHandler.post {
+                                BotBridgeCoordinator.uiListener?.onCodeRequested()
+                            }
+                            return BotBridgeCoordinator.prepareForCode()
                         }
-                        return BotBridgeCoordinator.prepareForCode()
-                    }
 
-                    fun requestPassword(): String {
-                        updateStatusAndNotification("Требуется пароль 2FA Telegram!", true)
-                        mainHandler.post {
-                            BotBridgeCoordinator.uiListener?.onPasswordRequested()
+                        fun requestPassword(): String {
+                            updateStatusAndNotification("Требуется пароль 2FA Telegram!", true)
+                            mainHandler.post {
+                                BotBridgeCoordinator.uiListener?.onPasswordRequested()
+                            }
+                            return BotBridgeCoordinator.prepareForPassword()
                         }
-                        return BotBridgeCoordinator.prepareForPassword()
-                    }
 
-                    fun onStatusChange(status: String, isRunning: Boolean) {
-                        updateStatusAndNotification(status, isRunning)
-                    }
+                        fun onStatusChange(status: String, isRunning: Boolean) {
+                            updateStatusAndNotification(status, isRunning)
+                        }
 
-                    fun onLoggedIn(username: String, userId: Long) {
-                        BotBridgeCoordinator.loggedInUser = username
-                        mainHandler.post {
-                            BotBridgeCoordinator.uiListener?.onLoggedIn(username, userId)
+                        fun onLoggedIn(username: String, userId: Long) {
+                            BotBridgeCoordinator.loggedInUser = username
+                            mainHandler.post {
+                                BotBridgeCoordinator.uiListener?.onLoggedIn(username, userId)
+                            }
+                        }
+
+                        fun onError(error: String) {
+                            mainHandler.post {
+                                BotBridgeCoordinator.uiListener?.onError(error)
+                            }
                         }
                     }
 
-                    fun onError(error: String) {
-                        mainHandler.post {
-                            BotBridgeCoordinator.uiListener?.onError(error)
+                    bridge.callAttr(
+                        "start_bot",
+                        apiId,
+                        apiHash,
+                        phone,
+                        password2FA,
+                        filesDir.absolutePath,
+                        callback
+                    )
+
+                } catch (e: Throwable) {
+                    updateStatusAndNotification("Ошибка: ${e.message}", false)
+                    mainHandler.post {
+                        BotBridgeCoordinator.uiListener?.onError(e.message ?: "Unknown error")
+                    }
+                } finally {
+                    synchronized(threadLock) {
+                        if (activePythonThread === Thread.currentThread()) {
+                            activePythonThread = null
                         }
                     }
-                }
-
-                bridge.callAttr(
-                    "start_bot",
-                    apiId,
-                    apiHash,
-                    phone,
-                    password2FA,
-                    filesDir.absolutePath,
-                    callback
-                )
-
-            } catch (e: Throwable) {
-                updateStatusAndNotification("Ошибка: ${e.message}", false)
-                mainHandler.post {
-                    BotBridgeCoordinator.uiListener?.onError(e.message ?: "Unknown error")
                 }
             }
         }
@@ -205,15 +216,17 @@ class SpambusterService : Service() {
 
         BotBridgeCoordinator.cancelWait()
 
-        thread {
-            try {
-                if (Python.isStarted()) {
-                    val py = Python.getInstance()
-                    val bridge = py.getModule("bot_bridge")
-                    bridge.callAttr("stop_bot")
+        synchronized(threadLock) {
+            thread {
+                try {
+                    if (Python.isStarted()) {
+                        val py = Python.getInstance()
+                        val bridge = py.getModule("bot_bridge")
+                        bridge.callAttr("stop_bot")
+                    }
+                } catch (e: Throwable) {
+                    // ignore shutdown exceptions
                 }
-            } catch (e: Throwable) {
-                // ignore shutdown exceptions
             }
         }
 

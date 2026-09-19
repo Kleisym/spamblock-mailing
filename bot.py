@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import contextmanager
+import collections
 import copy
 import getpass
 import json
@@ -10,7 +11,7 @@ import shutil
 import sqlite3
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from telethon import TelegramClient, errors, events, utils
 from telethon.errors import SessionPasswordNeededError
@@ -557,10 +558,13 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?", (time.time(), task_id))
 
-    def restore_counter(self, task_id: int, count: int):
+    def restore_counter(self, task_id: int, count: int, last_sent_at: Optional[float] = None):
         with self._conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE broadcast_tasks SET current_count = ? WHERE id = ?", (count, task_id))
+            if last_sent_at is not None:
+                cursor.execute("UPDATE broadcast_tasks SET current_count = ?, last_sent_at = ? WHERE id = ?", (count, last_sent_at, task_id))
+            else:
+                cursor.execute("UPDATE broadcast_tasks SET current_count = ? WHERE id = ?", (count, task_id))
 
     def count_tasks_for_template(self, template_name: str, account_id: int = 0) -> int:
         clean_name = template_name.strip("<>").strip()
@@ -1685,21 +1689,46 @@ async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: An
         pass
 
 class BroadcasterService:
+    _ACTIVE_INSTANCES: Dict[int, 'BroadcasterService'] = {}
+
     def __init__(self, client: TelegramClient, account_id: int = 0):
         self.client = client
         self.account_id = account_id
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
+        self._sending_chats: Set[int] = set()
+        self._last_sent_chat: Dict[int, float] = {}
 
     def start(self):
-        if not self.is_running:
-            self.is_running = True
-            self._task = asyncio.create_task(self._loop())
+        # Stop any previous active instance for this account to prevent duplicate background loops
+        old = BroadcasterService._ACTIVE_INSTANCES.get(self.account_id)
+        if old and old is not self:
+            log_info(f"[LIFECYCLE] Остановка предыдущего экземпляра BroadcasterService для аккаунта {self.account_id}")
+            old.stop()
+        BroadcasterService._ACTIVE_INSTANCES[self.account_id] = self
+
+        if self.is_running and self._task and not self._task.done():
+            log_info(f"[LIFECYCLE] BroadcasterService уже запущен для аккаунта {self.account_id}.")
+            return
+        self.is_running = True
+        try:
+            loop = asyncio.get_running_loop()
+            self._task = loop.create_task(self._loop())
+        except RuntimeError:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    self._task = loop.create_task(self._loop())
+            except Exception:
+                pass
 
     def stop(self):
         self.is_running = False
         if self._task and not self._task.done():
             self._task.cancel()
+        self._sending_chats.clear()
+        if BroadcasterService._ACTIVE_INSTANCES.get(self.account_id) is self:
+            BroadcasterService._ACTIVE_INSTANCES.pop(self.account_id, None)
 
     async def _loop(self):
         import gc
@@ -1727,32 +1756,46 @@ class BroadcasterService:
                     mode = task.get("mode", "interval")
                     last_sent = task.get("last_sent_at", 0)
                     interval = task.get("interval_seconds", 0)
+                    chat_id = task["chat_id"]
+
+                    # Skip if chat is currently in-flight
+                    if chat_id in self._sending_chats:
+                        continue
 
                     if mode == "hybrid":
                         current_count = task.get("current_count", 0)
                         threshold = task.get("counter_threshold", 1)
                         if (now - last_sent >= interval) and (current_count >= threshold):
-                            chat_id = task["chat_id"]
                             template_name = task["template_name"]
 
                             rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
                             effective_name = rotation_tpl if rotation_tpl else template_name
+
+                            # ATOMIC PRE-RESET: atomically reset count and update last_sent_at before network I/O
+                            # so handle_counter_event does not trigger simultaneously during send_broadcast_post
+                            db.reset_hybrid_task(task["id"])
 
                             log_info(f"[HYBRID] Чат {chat_id}: набрано {current_count}/{threshold} соо и прошло {interval}с. Отправляю '{effective_name}'...")
                             success = await self._send_task(task["id"], chat_id, effective_name, task=task)
-                            if success:
-                                db.reset_hybrid_task(task["id"])
+                            if not success:
+                                db.restore_counter(task["id"], threshold, last_sent_at=now - interval + 15)
                             await asyncio.sleep(1.5)
                     else:
                         if now - last_sent >= interval:
-                            chat_id = task["chat_id"]
                             template_name = task["template_name"]
 
                             rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
                             effective_name = rotation_tpl if rotation_tpl else template_name
 
-                            db.update_task_last_sent(task["id"])
-                            await self._send_task(task["id"], chat_id, effective_name, task=task)
+                            success = await self._send_task(task["id"], chat_id, effective_name, task=task)
+                            if success:
+                                db.update_task_last_sent(task["id"])
+                            else:
+                                with db._conn() as conn:
+                                    conn.execute(
+                                        "UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?",
+                                        (now - interval + 15, task["id"])
+                                    )
                             # Small delay between different chats in interval batch to avoid flood ban
                             await asyncio.sleep(1.5)
 
@@ -1780,6 +1823,11 @@ class BroadcasterService:
                 await asyncio.sleep(3.0)
 
     async def handle_counter_event(self, chat_id: int):
+        # Skip counter event check if chat is already in-flight sending
+        if chat_id in self._sending_chats:
+            log_info(f"[DEDUP] Чат {chat_id}: пропуск события счетчика (отправка уже в процессе).")
+            return
+
         ready_tasks = db.increment_and_check_counter(chat_id, account_id=self.account_id)
         for task in ready_tasks:
             template_name = task["template_name"]
@@ -1798,6 +1846,19 @@ class BroadcasterService:
             log_error(f"[ERROR] Шаблон '{template_name}' не найден в базе данных")
             return False
 
+        # --- DEDUPLICATION GUARD 1: In-flight chat lock ---
+        if chat_id in self._sending_chats:
+            log_info(f"[DEDUP] Чат {chat_id}: отправка уже выполняется! Блокирую параллельный дубликат.")
+            return False
+
+        # --- DEDUPLICATION GUARD 2: Cooldown debounce per chat (minimum 4.0s between broadcasts) ---
+        now_ts = time.time()
+        last_sent_ts = self._last_sent_chat.get(chat_id, 0.0)
+        if (now_ts - last_sent_ts) < 4.0:
+            log_info(f"[DEBOUNCE] Чат {chat_id}: прошло всего {now_ts - last_sent_ts:.1f}с с прошлой отправки. Блокирую дубликат.")
+            return False
+
+        self._sending_chats.add(chat_id)
         try:
             try:
                 peer = await self.client.get_input_entity(chat_id)
@@ -1811,6 +1872,7 @@ class BroadcasterService:
                 media_files=template["media_files"],
                 bundle=template.get("bundle")
             )
+            self._last_sent_chat[chat_id] = time.time()
             return True
         except errors.SlowModeWaitError as e:
             log_error(f"[SLOWMODE] Медленный режим в чате {chat_id}: нужно подождать {e.seconds}с")
@@ -1835,6 +1897,8 @@ class BroadcasterService:
         except Exception as e:
             log_error(f"[ERROR] Ошибка отправки рассылки в чат {chat_id}: {e}")
             return False
+        finally:
+            self._sending_chats.discard(chat_id)
 
 HELP_TEXT = """
 **⚙️ Управление юзерботом**
@@ -2081,7 +2145,38 @@ async def _notify(event: Any, text: str, auto_delete: int = 5):
         except Exception as e:
             log_error(f"[ERROR] Ошибка отправки ответа на команду: {e}")
 
+class MessageDedupRing:
+    """O(1) ring buffer for message deduplication across reconnects and burst updates."""
+    def __init__(self, maxsize: int = 2000):
+        self.maxsize = maxsize
+        self._deque: Deque[Tuple[int, int]] = collections.deque()
+        self._set: Set[Tuple[int, int]] = set()
+
+    def check_and_add(self, chat_id: int, msg_id: int) -> bool:
+        """Returns True if already seen (duplicate), False if new."""
+        key = (chat_id, msg_id)
+        if key in self._set:
+            return True
+        if len(self._deque) >= self.maxsize:
+            old = self._deque.popleft()
+            self._set.discard(old)
+        self._deque.append(key)
+        self._set.add(key)
+        return False
+
+_GLOBAL_DEDUP_RING = MessageDedupRing(2000)
+
 def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_id: int, acc_cfg: Optional[Dict[str, Any]] = None):
+    # Always keep client's broadcaster reference current
+    client._spambuster_broadcaster = broadcaster
+
+    # Guard against duplicate handler registration on client reconnection or re-init
+    if getattr(client, "_spambuster_events_registered", False):
+        log_info(f"[LIFECYCLE] Обработчики событий уже зарегистрированы для клиента {my_id}. Пропуск повторной регистрации.")
+        return
+
+    client._spambuster_events_registered = True
+
     if acc_cfg is None:
         acc_cfg = CONFIG
 
@@ -2092,7 +2187,13 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     @client.on(events.NewMessage(incoming=True))
     async def incoming_handler(event: Any):
         chat_id = event.chat_id
-        await broadcaster.handle_counter_event(chat_id)
+        msg_id = getattr(event, "id", None)
+        if msg_id and chat_id:
+            if _GLOBAL_DEDUP_RING.check_and_add(chat_id, msg_id):
+                return
+
+        active_broadcaster = getattr(client, "_spambuster_broadcaster", broadcaster)
+        await active_broadcaster.handle_counter_event(chat_id)
 
         if event.is_private:
             return
@@ -2838,9 +2939,24 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
 
     session_name = acc_cfg.get("session_name") or f"session_{acc_name}"
     session_path = BASE_DIR / session_name
-    client = TelegramClient(str(session_path), api_id, api_hash, catch_up=False)
+    client = TelegramClient(
+        str(session_path),
+        api_id,
+        api_hash,
+        catch_up=False,
+        connection_retries=None,
+        retry_delay=2,
+        auto_reconnect=True,
+        timeout=15,
+    )
 
-    await authenticate_client(client, acc_cfg.get("phone", ""), acc_name=acc_name)
+    while True:
+        try:
+            await authenticate_client(client, acc_cfg.get("phone", ""), acc_name=acc_name)
+            break
+        except (ConnectionError, OSError, asyncio.TimeoutError) as conn_err:
+            log_error(f"[START][{acc_name}] Ошибка сети (нет интернета / VPN): {conn_err}. Повторное подключение через 5с...")
+            await asyncio.sleep(5)
 
     me = await client.get_me()
     username_str = f"@{me.username}" if me.username else me.first_name
@@ -2853,7 +2969,20 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
     print(f"✅ Аккаунт [{acc_name}] {username_str} (ID: {me.id}) подключен и запущен 24/7!")
 
     try:
-        await client.run_until_disconnected()
+        while True:
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                await client.run_until_disconnected()
+            except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                log_error(f"[RECONNECT][{acc_name}] Потеря связи (VPN/сеть): {e}. Автоматический реконнект через 3с...")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                break
     finally:
         broadcaster.stop()
 
