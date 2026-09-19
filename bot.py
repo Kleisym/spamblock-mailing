@@ -244,6 +244,34 @@ def log_info(msg: str):
 def log_error(msg: str):
     print(msg)
 
+_BOT_SYSTEM_MSG_IDS: Set[int] = set()
+
+def is_internal_bot_message(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    # 1. Collector status notifications and interactive prompts
+    if "добавлено в рассылку" in t and ("📥" in t or "Сообщение #" in t or "сообщение #" in t):
+        return True
+    if "Отправьте следующее сообщение или напишите" in t and (".закрыть" in t or "отменить" in t or ".отменить" in t):
+        return True
+    if "(для отмены .отменить)" in t or "(для отмены `.отменить`)" in t or "(для отмены отменить)" in t:
+        return True
+    if "Режим сбора" in t and ("активирован" in t or "начат" in t) and "📥" in t:
+        return True
+    if "Время ожидания сообщений (5 минут) истекло" in t:
+        return True
+    # 2. System command feedback
+    if t.startswith("⚙️ Управление юзерботом"):
+        return True
+    if t.startswith("👁 Тестовый предпросмотр:"):
+        return True
+    if t.startswith("❌ Настройка рассылки") and "отменена" in t:
+        return True
+    if t.startswith("✅ Рассылка") and ("запущена" in t or "остановлена" in t):
+        return True
+    return False
+
 class Database:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
@@ -394,6 +422,14 @@ class Database:
             if "bundle_json" in row.keys() and row["bundle_json"]:
                 bundle_raw = row["bundle_json"]
             bundle = json.loads(bundle_raw) if bundle_raw else []
+            if bundle:
+                clean_bundle = [it for it in bundle if not is_internal_bot_message(it.get("text", ""))]
+                if len(clean_bundle) != len(bundle):
+                    bundle = clean_bundle
+                    try:
+                        cursor.execute("UPDATE templates SET bundle_json = ? WHERE name = ?", (json.dumps(bundle), row["name"]))
+                    except Exception:
+                        pass
             return {
                 "name": row["name"],
                 "text": row["text"],
@@ -427,17 +463,27 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM templates ORDER BY created_at DESC")
             rows = cursor.fetchall()
-            return [
-                {
+            results = []
+            for r in rows:
+                bundle_raw = r["bundle_json"] if ("bundle_json" in r.keys() and r["bundle_json"]) else ""
+                bundle = json.loads(bundle_raw) if bundle_raw else []
+                if bundle:
+                    clean_bundle = [it for it in bundle if not is_internal_bot_message(it.get("text", ""))]
+                    if len(clean_bundle) != len(bundle):
+                        bundle = clean_bundle
+                        try:
+                            cursor.execute("UPDATE templates SET bundle_json = ? WHERE name = ?", (json.dumps(bundle), r["name"]))
+                        except Exception:
+                            pass
+                results.append({
                     "name": r["name"],
                     "text": r["text"],
                     "entities_hex": json.loads(r["entities_hex"]) if r["entities_hex"] else [],
                     "media_files": json.loads(r["media_files"]) if r["media_files"] else [],
-                    "bundle": json.loads(r["bundle_json"]) if ("bundle_json" in r.keys() and r["bundle_json"]) else [],
+                    "bundle": bundle,
                     "created_at": r["created_at"]
-                }
-                for r in rows
-            ]
+                })
+            return results
 
     def add_or_update_broadcast(
         self,
@@ -1419,7 +1465,8 @@ async def send_broadcast_post(
     bundle: Optional[List[Dict[str, Any]]] = None
 ):
     if bundle:
-        for idx, item in enumerate(bundle):
+        clean_bundle = [item for item in bundle if not is_internal_bot_message(item.get("text", ""))]
+        for idx, item in enumerate(clean_bundle):
             if idx > 0:
                 await asyncio.sleep(1.0)
 
@@ -1444,6 +1491,8 @@ async def send_broadcast_post(
                 media_files=item.get("media_files", [])
             )
     else:
+        if is_internal_bot_message(text):
+            return
         await send_single_item(
             client,
             chat_peer,
@@ -2117,33 +2166,35 @@ def parse_broadcast_params(first_line: str) -> Tuple[str, int, int, str, str, st
 
     return mode, interval_sec, threshold_count, template_name, folder_name, ""
 
-async def _notify(event: Any, text: str, auto_delete: int = 5):
+async def _notify(event: Any, text: str, auto_delete: int = 5, force_respond: bool = False):
+    msg = None
     try:
-        if getattr(event, "out", False) and not getattr(event.message, "media", None):
+        if getattr(event, "out", False) and not getattr(event.message, "media", None) and not force_respond:
             msg = await event.edit(text)
         else:
             msg = await event.respond(text)
-        if auto_delete > 0 and msg:
-            async def _delayed_delete(target_msg: Any, delay: int):
-                try:
-                    await asyncio.sleep(delay)
-                    await target_msg.delete()
-                except Exception:
-                    pass
-            asyncio.create_task(_delayed_delete(msg, auto_delete))
     except Exception:
         try:
             msg = await event.respond(text)
-            if auto_delete > 0 and msg:
-                async def _delayed_delete(target_msg: Any, delay: int):
-                    try:
-                        await asyncio.sleep(delay)
-                        await target_msg.delete()
-                    except Exception:
-                        pass
-                asyncio.create_task(_delayed_delete(msg, auto_delete))
         except Exception as e:
             log_error(f"[ERROR] Ошибка отправки ответа на команду: {e}")
+
+    if msg and hasattr(msg, "id"):
+        _BOT_SYSTEM_MSG_IDS.add(msg.id)
+        if len(_BOT_SYSTEM_MSG_IDS) > 2000:
+            try:
+                _BOT_SYSTEM_MSG_IDS.pop()
+            except Exception:
+                pass
+
+    if auto_delete > 0 and msg:
+        async def _delayed_delete(target_msg: Any, delay: int):
+            try:
+                await asyncio.sleep(delay)
+                await target_msg.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_delayed_delete(msg, auto_delete))
 
 class MessageDedupRing:
     """O(1) ring buffer for message deduplication across reconnects and burst updates."""
@@ -2255,8 +2306,17 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         if not getattr(event, "out", False) and event.sender_id != my_id:
             return
 
-        chat_id = event.chat_id
+        msg_id = getattr(event, "id", None)
+        if msg_id and msg_id in _BOT_SYSTEM_MSG_IDS:
+            return
+
         raw = event.raw_text or ""
+        if is_internal_bot_message(raw):
+            if msg_id:
+                _BOT_SYSTEM_MSG_IDS.add(msg_id)
+            return
+
+        chat_id = event.chat_id
         collector_key = (my_id, chat_id)
 
         if collector_key in ACTIVE_COLLECTORS or chat_id in ACTIVE_COLLECTORS:
@@ -2430,9 +2490,18 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         )
 
     async def collect_message_to_session(event: Any, session: Dict[str, Any]):
+        msg = event.message
+        if getattr(msg, "id", None) in _BOT_SYSTEM_MSG_IDS:
+            return
+
+        text = msg.raw_text or ""
+        if is_internal_bot_message(text):
+            if hasattr(msg, "id"):
+                _BOT_SYSTEM_MSG_IDS.add(msg.id)
+            return
+
         session["last_active"] = time.time()
         template_name = session["template_name"]
-        msg = event.message
         grouped_id = getattr(msg, "grouped_id", None)
 
         if grouped_id and session["items"] and session["items"][-1].get("grouped_id") == grouped_id:
@@ -2463,7 +2532,6 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 clear_existing=False
             )
 
-        text = msg.raw_text or ""
         entities_hex = serialize_entities(msg.entities)
         is_fwd = bool(getattr(msg, "fwd_from", None))
 
@@ -2482,7 +2550,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             event,
             f"📥 Сообщение #{count} добавлено в рассылку **{template_name}**.\n"
             f"Отправьте следующее сообщение или напишите `.закрыть` (для отмены `.отменить`).",
-            auto_delete=4
+            auto_delete=4,
+            force_respond=True
         )
 
     async def finish_collector_session(event: Any, session: Dict[str, Any], session_key: Any = None):
@@ -2490,7 +2559,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             session_key = (my_id, event.chat_id) if (my_id, event.chat_id) in ACTIVE_COLLECTORS else event.chat_id
         chat_id = event.chat_id
         template_name = session["template_name"]
-        items = session["items"]
+        items = [it for it in session["items"] if not is_internal_bot_message(it.get("text", ""))]
+        session["items"] = items
 
         if not items:
             clean_name = re.sub(r'[\\/*?:"<>|]', '_', template_name.strip("<>").strip())
