@@ -1,7 +1,27 @@
-name: probe
+name: probe2
 on: [push]
+permissions:
+  contents: write
 jobs:
-  probe:
+  test:
+    name: Test (Python)
     runs-on: ubuntu-latest
     steps:
-      - run: echo hello
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Sync bot.py into the Android python sources
+        run: |
+          mkdir -p android/app/src/main/python
+          cp bot.py android/app/src/main/python/bot.py
+      - name: Verify the copies are identical
+        run: |
+          if ! cmp -s bot.py android/app/src/main/python/bot.py; then
+            echo "bot.py and the Android copy diverged"
+            exit 1
+          fi
+      - name: Run test suite
+        run: python -m pytest tests/ -q
