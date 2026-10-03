@@ -7,12 +7,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import kotlin.concurrent.thread
@@ -32,6 +34,8 @@ class SpambusterService : Service() {
         const val ACTION_HEARTBEAT = "com.spambuster.app.ACTION_HEARTBEAT"
         private const val HEARTBEAT_INTERVAL_MS = 60000L
         private const val WAKE_LOCK_TAG = "Spambuster::RuntimeWakeLock"
+        private const val MIN_RUNTIME_FOR_RESTART_MS = 60_000L
+        private const val RESTART_DELAY_MS = 10_000L
 
         @Volatile
         var activePythonThread: Thread? = null
@@ -67,7 +71,19 @@ class SpambusterService : Service() {
         }
 
         val notification = buildForegroundNotification("Инициализация юзербота...")
-        startForeground(NOTIFICATION_ID, notification)
+        try {
+            val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            } else 0
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+        } catch (e: Exception) {
+            // Android 12+ can refuse a foreground start from the background
+            // (e.g. a sticky restart on some OEM firmwares). Crashing here used
+            // to take the whole app down; retry on the next start instead.
+            updateStatusAndNotification("Android не разрешил фоновый запуск. Откройте приложение.", false)
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         acquireRuntimeWakeLock()
         startHeartbeat()
@@ -161,6 +177,7 @@ class SpambusterService : Service() {
                 return
             }
 
+            val startedAt = System.currentTimeMillis()
             activePythonThread = thread(name = "Spambuster-Python-Thread") {
                 try {
                     if (!Python.isStarted()) {
@@ -225,9 +242,28 @@ class SpambusterService : Service() {
                             activePythonThread = null
                         }
                     }
+                    scheduleRestartIfNeeded(startedAt)
                 }
             }
         }
+    }
+
+    /**
+     * The Python side only returns when it was stopped or hit an error. If the
+     * user did not press "Стоп" and the bot had been running for a while (so it
+     * is not a login/config error that would just fail again), start it again.
+     */
+    private fun scheduleRestartIfNeeded(startedAt: Long) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(KEY_SERVICE_ENABLED, false)) return
+        val ranFor = System.currentTimeMillis() - startedAt
+        if (ranFor < MIN_RUNTIME_FOR_RESTART_MS) return
+        mainHandler.postDelayed({
+            if (getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean(KEY_SERVICE_ENABLED, false)) {
+                updateStatusAndNotification("Перезапуск юзербота...", true)
+                startPythonBot()
+            }
+        }, RESTART_DELAY_MS)
     }
 
     private fun updateStatusAndNotification(status: String, isRunning: Boolean) {
@@ -329,7 +365,7 @@ class SpambusterService : Service() {
             if (it.isHeld) it.release()
         }
         releaseRuntimeWakeLock()
-        stopForeground(true)
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 

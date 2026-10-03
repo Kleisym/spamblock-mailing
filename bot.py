@@ -539,7 +539,7 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT id FROM broadcast_tasks 
-                WHERE chat_id = ? AND template_name = ? AND (account_id = ? OR account_id = 0)
+                WHERE chat_id = ? AND template_name = ? AND account_id = ?
             """, (chat_id, clean_name, account_id))
             row = cursor.fetchone()
             if row:
@@ -551,6 +551,7 @@ class Database:
                         counter_threshold = ?,
                         is_active = 1,
                         folder_name = ?,
+                        current_count = 0,
                         last_sent_at = 0.0
                     WHERE id = ?
                 """, (account_id, mode, interval_seconds, counter_threshold, folder_name, row["id"]))
@@ -679,8 +680,8 @@ class Database:
             cursor = conn.cursor()
             row = cursor.execute(
                 "SELECT id, is_active, mode, interval_seconds, counter_threshold, account_id "
-                "FROM broadcast_tasks WHERE chat_id = ? AND template_name = ?",
-                (chat_id, clean_name)
+                "FROM broadcast_tasks WHERE chat_id = ? AND template_name = ? AND account_id = ?",
+                (chat_id, clean_name, account_id)
             ).fetchone()
             if row is None:
                 cursor.execute(
@@ -825,6 +826,63 @@ class Database:
                             WHERE id = ?
                         """, (new_count, t["id"]))
         return ready_tasks
+
+    # ---- atomic claims: only one caller can win a due task -----------------
+    def claim_interval_task(self, task_id: int, now: float) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE broadcast_tasks SET last_sent_at = ? "
+                "WHERE id = ? AND is_active = 1 AND (? - COALESCE(last_sent_at, 0)) >= interval_seconds",
+                (now, task_id, now),
+            )
+            return cur.rowcount == 1
+
+    def claim_hybrid_task(self, task_id: int, now: float) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE broadcast_tasks SET last_sent_at = ?, current_count = 0 "
+                "WHERE id = ? AND is_active = 1 AND current_count >= counter_threshold "
+                "AND (? - COALESCE(last_sent_at, 0)) >= interval_seconds",
+                (now, task_id, now),
+            )
+            return cur.rowcount == 1
+
+    def schedule_retry(self, task: Dict[str, Any], delay: float):
+        """Make a claimed-but-unsent task due again after `delay` seconds."""
+        mode = task.get("mode") or "interval"
+        interval = task.get("interval_seconds") or 0
+        threshold = task.get("counter_threshold") or 0
+        with self._conn() as conn:
+            if mode in ("interval", "hybrid"):
+                conn.execute(
+                    "UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?",
+                    (time.time() - interval + max(delay, 1.0), task["id"]),
+                )
+            if mode in ("counter", "hybrid"):
+                conn.execute(
+                    "UPDATE broadcast_tasks SET current_count = MAX(current_count, ?) WHERE id = ?",
+                    (threshold, task["id"]),
+                )
+
+    def deactivate_task(self, task_id: int):
+        with self._conn() as conn:
+            conn.execute("UPDATE broadcast_tasks SET is_active = 0 WHERE id = ?", (task_id,))
+
+    def adopt_legacy_rows(self, account_id: int):
+        """
+        Rows saved with account_id = 0 (old versions) were picked up by EVERY
+        running account, so each of them sent the same post. The first account
+        that starts now takes ownership of them.
+        """
+        if not account_id:
+            return
+        with self._conn() as conn:
+            for table in ("broadcast_tasks", "folder_broadcasts", "chat_rotations", "muted_peers"):
+                try:
+                    conn.execute(f"UPDATE OR IGNORE {table} SET account_id = ? WHERE account_id = 0 OR account_id IS NULL", (account_id,))
+                    conn.execute(f"DELETE FROM {table} WHERE account_id = 0 OR account_id IS NULL")
+                except Exception:
+                    pass
 
     def reset_hybrid_task(self, task_id: int):
         with self._conn() as conn:
@@ -1312,88 +1370,123 @@ def is_peer_muted(account_id: int, peer_id: Any, chat_id: Optional[int] = None) 
         return False
     return False
 
+# =============================================================================
+# SPAM / ADVERTISING DETECTION
+#
+# Three layers, evaluated in this order:
+#   1. Hard structural evidence (score 100): inline-bot posts, invisible
+#      characters, hidden or mass mentions, autoposter watermarks.
+#   2. Weighted lexicon + layout scoring. Spam topics (stars, TON, NFT,
+#      accounts, "earnings", casino...), sale verbs, contact routing, links and
+#      catalogue layout each add points.
+#   3. Conversational dampeners. They are capped and never cancel strong
+#      commercial evidence, and the "buyer question" veto only applies to
+#      messages that carry no sale lexicon, routing or links.
+#
+# Classification threshold: score >= SPAM_THRESHOLD.
+# =============================================================================
+
+SPAM_THRESHOLD = 50
+
+# Invisible characters used for ghost pings. ZWJ (\u200d) and variation
+# selectors are deliberately NOT here: they are part of normal emoji.
+_INVISIBLE_RE = re.compile(r"[\u200b\u200e\u200f\u2060-\u2064\u2066-\u206f\ufeff\u180e\u3164\u115f\u1160]")
+
 SPAM_SIGNATURES = [
-    # 1. Any broadcaster / userbot watermarks (Russian & English):
-    r"(?:отправлено|рассылаю|рассылка|рассылается|передано|переслано|опубликовано|запощено|размещено|сделано|постинг|автопост|автопостинг|создано|работает)\s+(?:с\s+помощью|через|с|в)\s+@?[a-zA-Z0-9_]{3,32}",
-    r"(?:sent|posted|broadcasted|forwarded|powered|created)\s+(?:via|by|with|through)\s+@?[a-zA-Z0-9_]{3,32}",
-
-    # 2. Promotional software / bot mentions
-    r"(?:скрипт|софт|программ\w*|бот)\s+(?:для\s+)?(?:рассыл|спам|автопост|трафик|пиар|реклам|инвайт)\w*\s*[:\-—]?\s*@?\w+",
-    r"@[a-zA-Z0-9_]*(?:autopost|sender|spambot|postbot|mailer|blast|repost|prbot|trafficbot|mailing)[a-zA-Z0-9_]*",
-    r"заказать\s+(?:рассылку|спам|рекламу|трафик|инвайтинг)",
-
-    # 3. Seller routing & channels lists
-    r"(?:пишите|писать|связь|обращаться|отпишите)\s+(?:в\s+лс|в\s+личку|менеджеру|сюда)?\s*[:\-—]?\s*@\w+",
-    r"(?:по\s+поводу\s+(?:рекламы|покупки|сотрудничества)|для\s+заказа)\s*[:\-—]?\s*@\w+",
-    r"(?:наш\s+(?:канал|чат|бот|шоп|магазин)|вход\s+в\s+чат)\s*[:\-—]?\s*(?:https?://)?t\.me/\+?[a-zA-Z0-9_]+",
-    r"(?:📩|👉|📲|💬|✍️|✉️)\s*(?:в\s+лс|пишите|связь|обращаться)?\s*@\w+",
-
-    # 4. Recruitment and manager ads
-    r"ищу\s+менеджер\w*",
-    r"менеджер\w*\s+по\s+продажам",
-    r"в\s+(?:мой|наш)\s+канал\s*[:\-—]?\s*@\w+",
-
-    # 5. Catalog bullet points with @ channels or links
-    r"[1-9]️⃣\s*@\w+",
-    r"[①-⑩]\s*@\w+",
-
-    # 6. Product/service selling
-    r"продам\s+(?:канал[ыа]?|чат[ыа]?)",
-    r"продам\s+(?:акк[иа]?|аккаунт[ыа]?|сетку|базу|групп[уыа]|бота|клики)",
-    r"прода[юе]тся\s+(?:канал[ыа]?|чат[ыа]?)",
-    r"(?:эро|азартн\w*|казино|крипт\w*|гемблинг)\s+тематик\w*",
-    r"скупаю\s+(?:канал[ыа]?|акк[иа]?|аккаунт[ыа]?|групп[уыа]|голду|штукенции)",
-    r"(?:купишь|купите|покупайте|покупай)\s+(?:рекламу|канал[ыа]?|чат[ыа]?|акк[иа]?|групп[уыа]|бота)",
-    r"без\s+спам\s*блока",
-    r"без\s+пароля",
-    r"\d+\s*кликов\s*[-–—:]",
-    r"клики\s*:",
-    r"телеграмм\s+аккаунты\s*:",
-    r"купить\s+можно\s+за\s+звезды",
-    r"прода[южа]\s+зв[её]зд",
-    r"казино|гемблинг|азарт|1win|stake",
-    r"подарки\s+ниже\s+флора",
+    # Autoposter / userbot watermarks
+    r"(?:отправлено|рассылаю|рассылка|рассылается|опубликовано|запощено|размещено|постинг|автопост\w*)\s+(?:с\s+помощью|через|в|с)\s+@?[a-z0-9_]{3,32}\b",
+    r"\b(?:sent|posted|broadcasted|powered)\s+(?:via|by|with|through)\s+@?[a-z0-9_]{3,32}\b",
+    # Mailing software / services
+    r"(?:скрипт|софт|программ\w*|бот)\s+(?:для\s+)?(?:рассыл|спам|автопост|инвайт)\w*\s*[:\-—]?\s*@?\w+",
+    r"@[a-z0-9_]*(?:autopost|sender|spambot|postbot|mailer|repost|trafficbot|mailing)[a-z0-9_]*",
+    r"заказать\s+(?:рассылку|спам|инвайтинг)",
 ]
-
 SPAM_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SPAM_SIGNATURES]
-COUNTRY_FLAGS = ["🇺🇸", "🇮🇳", "🇮🇩", "🇨🇴", "🇲🇲", "🇧🇩", "🇧🇷", "🇨🇦", "🇲🇽", "🇹🇷", "🇨🇱", "🇿🇦", "🇷🇺"]
+
+COUNTRY_FLAGS = ["🇺🇸", "🇮🇳", "🇮🇩", "🇨🇴", "🇲🇲", "🇧🇩", "🇧🇷", "🇨🇦", "🇲🇽", "🇹🇷", "🇨🇱", "🇿🇦", "🇷🇺",
+                 "🇺🇦", "🇰🇿", "🇧🇾", "🇺🇿", "🇬🇧", "🇩🇪", "🇵🇭", "🇻🇳", "🇳🇬", "🇵🇰", "🇪🇬"]
+
+# (pattern, points, label). Topics that are almost only ever spam in PR chats.
+_SPAM_LEXICON = [
+    (r"зв[её]зд\w*|\bstars?\b", 20, "stars"),
+    (r"\bтон\w{0,2}\b|\bton\b|\busdt\b|\bbtc\b|крипт\w*|\bкрипта\b|\bp2p\b|обменник\w*", 20, "crypto"),
+    (r"\bнфт\b|\bnft\b|подар(?:ок|ки|ков)\b|флор\w*", 20, "nft_gifts"),
+    (r"\bголд\w*|\bgold\b|\bюс\b|\bробукс\w*|\bгемы\b|\bдонат\w*", 15, "game_currency"),
+    (r"аккаунт\w*|\bакк[иа]?\b|\bакков\b|\bсессии\b|\btdata\b|номер(?:а|ов)\s+(?:стран|рф|сша)|смен\w*\s+номер\w*", 20, "accounts"),
+    (r"заработ\w*|зарабат\w*|работа\s+с\s+телефона|\bдоход\w*|пассивн\w*|без\s+вложени\w*|\bв\s+день\b|\bв\s+сутки\b|\$\s*в\s+(?:день|неделю)|удал[её]нн?\w*\s+работ\w*|\bподработк\w*|набор\s+в\s+команду|ищем\s+людей|\bсхем[ауы]\b|\bарбитраж\w*", 35, "earnings"),
+    (r"казино|\bcasino\b|гемблинг|\bazart\b|\b1win\b|\bstake\b|ставк[иа]\b|фриспин\w*|\bбонус\w*\s+(?:за|при)\s+регистрац\w*|промокод\w*", 35, "gambling"),
+    (r"\bинтим\w*|\b18\s*\+|\bэро\b|\bслив\w*|\bприват\w*\s+канал", 35, "adult"),
+    (r"\bклик(?:и|ов)\b|\bпросмотр(?:ы|ов)\b\s+(?:на|для)|\bнакрутк\w*|\bподписчик(?:и|ов)\b\s+(?:на|в|для)|\bреакци(?:и|й)\b\s+на", 20, "smm"),
+    (r"\bвербовк\w*|\bдроп\w*\b|\bобнал\w*|\bкарты?\s+(?:физ|юр)", 30, "fraud"),
+]
+_SPAM_LEXICON = [(re.compile(p, re.IGNORECASE), pts, label) for p, pts, label in _SPAM_LEXICON]
+_STRONG_TOPICS = {"earnings", "gambling", "adult", "fraud"}
+_PROMO_RE = re.compile(
+    r"\b(?:бонус\w*|промокод\w*|акци[яи]|скидк\w*|бесплатн\w*|халяв\w*|розыгрыш\w*|раздач\w*|выигр\w*|вывод\w*|оптом|опт\b)",
+    re.IGNORECASE,
+)
+
+_SALE_VERB_RE = re.compile(
+    r"\b(?:продам|продаю|прода[её]тся|прода[её]м|продажа|скупаю|скупка|скупаем|куплю|покупаю|обменяю|обмен|"
+    r"сдам|сдаю|предлагаю|предлагаем|оказываю|оказываем|отдам|раздаю|раздача|ищу\s+менеджер\w*|"
+    r"менеджер\w*\s+по\s+продажам|дешевле|дешево|дёшево|выгодно|недорого|по\s+курсу|ниже\s+рынка|"
+    r"купить\s+можно|можно\s+купить\s+за|в\s+наличии|цена\s+за|прайс\s*:|оплата\s+(?:в|через|картой|криптой|зв[её]здами))\b",
+    re.IGNORECASE,
+)
+_SELLER_ASK_RE = re.compile(
+    r"\b(?:купишь|купите|покупайте|покупай|закажи|заказывай|нужн[ыао]\s+(?:зв[её]зд|акк|подписчик|просмотр|клик|реклам))",
+    re.IGNORECASE,
+)
+_ROUTING_RE = re.compile(
+    r"(?:пиш(?:и|ите)|писать|связь|обращаться|отпиш(?:и|ите)|стучи(?:те)?|жду|вопросы|заказ|менеджер\w*|"
+    r"по\s+поводу\s+\w+|для\s+заказа|купить)\s*(?:в\s+лс|в\s+личку|в\s+пм|сюда|тут)?\s*[:\-—–]?\s*@\w+",
+    re.IGNORECASE,
+)
+_EMOJI_ROUTING_RE = re.compile(r"(?:📩|👉|📲|💬|✍️|✍|✉️|☎️|📞|➡️|⬇️)\s*(?:в\s+лс|пишите|связь|обращаться)?\s*@\w+", re.IGNORECASE)
+_DM_CTA_RE = re.compile(
+    r"(?:\bв\s+лс\b|\bв\s+личку\b|\bв\s+пм\b|\bлс\s+открыт\w*|подробн\w*\s+(?:в|по)\s+(?:лс|профил\w*|био|ссылк\w*|канал\w*)|"
+    r"ссылка\s+в\s+(?:профиле|био|описании)|жми\s+на|переходи\w*|\bтык\b)",
+    re.IGNORECASE,
+)
+_CATALOG_BULLET_RE = re.compile(r"^(?:[·•▪️▫️◾◽\-\—\*✅✔️☑️🔹🔸🔵🟢❗️❕]|\d+[\.\)\-\—]|[1-9]️⃣|[①-⑩])\s*")
+_BANNER_RE = re.compile(r"^(?:🔥|⚡️|⚡|📢|📣|💎|💰|💸|💵|🚀|🚨|❗️|‼️|⚠️|⭐️|⭐|🌟|💥|🎯|👉|📩|📲|💬|🎁|🤑|📈|🆕|🔝)")
+_PRICE_RE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:₽|руб\w*|р\b|\$|usd\w*|€|грн|тг|⭐|🌟|зв[её]зд\w*|ton\b|тон\b)", re.IGNORECASE)
+_LINK_RE = re.compile(r"t\.me/(?:\+|joinchat/|[a-z0-9_]{5,})|telegram\.me/|https?://\S+", re.IGNORECASE)
+_PRIVATE_LINK_RE = re.compile(r"t\.me/(?:\+|joinchat/)", re.IGNORECASE)
+_CONVO_RE = re.compile(
+    r"\b(?:я|мне|меня|мы|нас|ты|тебе|тебя|твой|твоем|твоём|привет|ку|здравствуйте|спасибо|спс|лол|хах\w*|хд|"
+    r"ладно|норм|почему|зачем|окей|ок|понял\w*|сорри|извини\w*|ага|угу|да|нет)\b",
+    re.IGNORECASE,
+)
 
 BUYER_QUESTION_TRIGGERS = [
-    r"\bпоч[её]м\b",
-    r"\bцена\b",
-    r"\bцену\b",
-    r"\bпрайс\b",
-    r"\bактуально\b",
-    r"\bсвободно\b",
-    r"\bстат[уа]\b",
-    r"\bстатистик[ау]\b",
-    r"\bохват\b",
-    r"\bчекни\s+лс\b",
-    r"\bответь(?:те)?\s+в\s+лс\b",
-    r"\bотпиши\b",
-    r"\bкуплю\s+рекламу\b",
-    r"\bхочу\s+купить\b",
-    r"\bзакреп\b",
+    r"\bпоч[её]м\b", r"\bцена\b", r"\bцену\b", r"\bпрайс\b", r"\bактуально\b",
+    r"\bсвободн\w*\b", r"\bстат[уа]\b", r"\bстатистик[ау]\b", r"\bохват\w*\b",
+    r"\bчекни\s+лс\b", r"\bответь(?:те)?\s+в\s+лс\b", r"\bкуплю\s+рекламу\b", r"\bхочу\s+купить\b",
+    r"\bпродашь\b", r"\bпрода[её]шь\b", r"\bпрода[её]те\b", r"\bсколько\s+стоит\b",
+    r"\bможно\s+(?:купить|взять|разместить|заказать)\b", r"\bместо\s+есть\b", r"\bесть\s+место\b",
+    r"\bзакреп\w*\b", r"\bслот\w*\b",
 ]
-
 BUYER_PATTERNS = [re.compile(p, re.IGNORECASE) for p in BUYER_QUESTION_TRIGGERS]
 
 GATEKEEPER_TRIGGERS = [
-    r"чтобы\s+писать\s+в\s+чат",
+    r"чтобы\s+(?:писать|отправлять\s+сообщения)\s+в\s+(?:чат|группу)",
     r"необходимо\s+подписаться",
-    r"подпишитесь\s+на\s+канал",
+    r"нужно\s+подписаться",
+    r"подпишитесь\s+на\s+(?:канал|наш)",
     r"обязательная\s+подписка",
     r"для\s+доступа\s+к\s+чату",
     r"пройдите\s+капчу",
-    r"подтвердите,\s*что\s+вы\s+не\s+бот",
+    r"подтвердите,?\s*что\s+вы\s+не\s+(?:бот|робот)",
+    r"you\s+must\s+(?:join|subscribe)",
 ]
-
 GATEKEEPER_PATTERNS = [re.compile(p, re.IGNORECASE) for p in GATEKEEPER_TRIGGERS]
 
 VERIFY_BUTTON_TEXTS = [
     "подписался", "я подписался", "проверить", "готово", "подтвердить",
-    "вступил", "продолжить", "check", "done", "verify", "i subscribed"
+    "вступил", "продолжить", "я не бот", "check", "done", "verify", "i subscribed", "i'm not a bot",
 ]
+
 
 def _utf16_slice(text: str, offset: int, length: int) -> str:
     try:
@@ -1402,294 +1495,237 @@ def _utf16_slice(text: str, offset: int, length: int) -> str:
     except Exception:
         return text[offset : offset + length]
 
-def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List[str]]:
-    """
-    Advanced Heuristic Spam Recognition Engine.
-    Evaluates message structure, layout typography, entity metadata,
-    routing CTAs, and conversational dampeners.
-    
-    Returns (score, primary_trigger, matched_factors).
-    Threshold for spam classification is score >= 50.
-    """
-    if not text:
-        return 0, "", []
 
-    factors: List[str] = []
-    clean_text = text.lower()
-    raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
-    clean_lines = [l.strip() for l in clean_text.splitlines() if l.strip()]
-
-    # =========================================================================
-    # 1. HARD TRIGGERS (Immediate 100 points)
-    # =========================================================================
-    # 1.1 Inline posting bot watermark / auto-poster
-    if message and getattr(message, "via_bot_id", None):
-        return 100, "sent_via_inline_bot", ["inline_bot"]
-
-    # 1.2 Invisible ghost ping characters (zero-width characters used for hidden mass-tagging)
-    if re.search(r"[\u200b\u200c\u200e\u200f\u2060-\u206f\ufeff]", text):
-        return 100, "invisible_ghost_ping", ["zero_width_ghost_chars"]
-
-    # 1.3 Entity inspection: hidden ghost mentions & mass tagging
-    if message and getattr(message, "entities", None):
-        from telethon.tl.types import (
-            MessageEntityMentionName,
-            MessageEntityMention,
-            MessageEntityTextUrl
+def _entity_evidence(text: str, message: Any) -> Optional[Tuple[str, str]]:
+    """Hidden or mass mentions carried by message entities."""
+    entities = getattr(message, "entities", None) if message is not None else None
+    if not entities:
+        return None
+    from telethon.tl.types import (
+        MessageEntityMentionName,
+        InputMessageEntityMentionName,
+        MessageEntityMention,
+        MessageEntityTextUrl,
+    )
+    user_mentions = 0
+    total_mentions = 0
+    hidden = False
+    for ent in entities:
+        is_user_ref = isinstance(ent, (MessageEntityMentionName, InputMessageEntityMentionName)) or (
+            isinstance(ent, MessageEntityTextUrl) and "tg://user?id=" in (ent.url or "").lower()
         )
-        mention_names = 0
-        text_urls_user = 0
-        total_mentions = 0
-        has_hidden_mention = False
+        if is_user_ref:
+            user_mentions += 1
+            total_mentions += 1
+            ent_text = _utf16_slice(text, ent.offset, ent.length)
+            if not re.search(r"\w", ent_text):
+                hidden = True
+        elif isinstance(ent, MessageEntityMention):
+            total_mentions += 1
+    if hidden:
+        return "hidden_ghost_mention", "mention_under_emoji_or_space"
+    if user_mentions >= 2 or total_mentions >= 4:
+        return "mass_entity_tagging", f"mentions_{total_mentions}"
+    return None
 
-        for ent in message.entities:
-            if isinstance(ent, MessageEntityMentionName):
-                mention_names += 1
-                total_mentions += 1
-                try:
-                    ent_text = _utf16_slice(text, ent.offset, ent.length)
-                    if not ent_text.strip() or not re.search(r'\w', ent_text):
-                        has_hidden_mention = True
-                except Exception:
-                    has_hidden_mention = True
-            elif isinstance(ent, MessageEntityMention):
-                total_mentions += 1
-            elif isinstance(ent, MessageEntityTextUrl):
-                if ent.url and "tg://user?id=" in ent.url.lower():
-                    text_urls_user += 1
-                    total_mentions += 1
-                    try:
-                        ent_text = _utf16_slice(text, ent.offset, ent.length)
-                        if not ent_text.strip() or not re.search(r'\w', ent_text):
-                            has_hidden_mention = True
-                    except Exception:
-                        has_hidden_mention = True
 
-        if mention_names >= 2 or text_urls_user >= 2 or total_mentions >= 3:
-            return 100, "mass_entity_tagging", [f"mentions_{total_mentions}"]
-
-        if has_hidden_mention:
-            return 100, "hidden_ghost_mention", ["mention_under_emoji_or_space"]
-
-    # 1.4 Direct signature matching (watermarks, spam tools, seller solicitations)
-    for pat in SPAM_PATTERNS:
-        if pat.search(clean_text):
-            return 100, pat.pattern, ["signature_match"]
-
-    # =========================================================================
-    # 2. HEURISTIC ACCUMULATIVE SCORING
-    # =========================================================================
-    score = 0
-
-    # 2.1 Layout & Visual Structure
-    # Banner / promo emojis at line starts (🔥, ⚡️, 📢, 💎, 💰, 🚀, 🚨, ❗️, ⚠️, ⭐️, 1️⃣, 2️⃣)
-    banner_emoji_lines = sum(
-        1 for l in raw_lines
-        if re.match(r"^(?:🔥|⚡️|📢|💎|💰|🚀|🚨|❗️|⚠️|⭐️|🌟|💥|🎯|👉|📩|📲|💬)", l)
-    )
-    if banner_emoji_lines >= 1:
-        pts = 15 if banner_emoji_lines == 1 else 25
-        score += pts
-        factors.append(f"banner_emojis(+{pts})")
-
-    # Itemized catalog bullet points (·, •, -, —, 1️⃣, 2️⃣, ①, ②)
-    bullet_lines = sum(
-        1 for l in raw_lines
-        if re.match(r"^(?:[·•\-\—\*]|\d+[\.\)\-\—]|[1-9]️⃣|[①-⑩])\s*", l)
-    )
-    if bullet_lines >= 1:
-        pts = 15 if bullet_lines == 1 else 25
-        score += pts
-        factors.append(f"bullet_points(+{pts})")
-
-    # Multi-block layout (structured advertisement with multiple separated sections)
-    if len(raw_lines) >= 3 or ("\n\n" in text and len(raw_lines) >= 2):
-        score += 15
-        factors.append("multiblock_layout(+15)")
-
-    # 2.2 Contacts, Routing & CTA (Call to Action)
-    # Contact block directed via emoji (e.g. 📩@SuKoW, 👉@user, 👉Пишите в лс @user)
-    has_emoji_contact = bool(re.search(
-        r'(?:📩|👉|📲|💬|✍️|✉️)\s*(?:в\s+лс|пишите|связь|обращаться)?\s*@\w+',
-        clean_text
-    ))
-    if has_emoji_contact:
-        score += 30
-        factors.append("emoji_contact_routing(+30)")
-
-    # Textual seller routing (пишите в лс @..., связь @...)
-    has_text_seller_contact = bool(re.search(
-        r'(?:пишите|писать|связь|обращаться|отпишите|в\s+лс|в\s+личку|менеджеру)\s*[:\-—]?\s*@\w+',
-        clean_text
-    ))
-    if has_text_seller_contact and not has_emoji_contact:
-        score += 25
-        factors.append("text_seller_routing(+25)")
-
-    # Channel links (t.me/+, joinchat, or t.me/username)
-    promo_links = re.findall(r't\.me/(?:\+|joinchat/|[a-zA-Z0-9_]{5,})', clean_text)
-    if promo_links:
-        pts = 25 if any("+" in link or "joinchat" in link for link in promo_links) else 15
-        score += pts
-        factors.append(f"promo_links(+{pts})")
-
-    # Multiple mentions / channel handles (@channel, @manager)
-    usernames = re.findall(r'@([a-zA-Z0-9_]{4,32})', text)
-    if len(usernames) >= 2:
-        score += 15
-        factors.append(f"multiple_usernames_{len(usernames)}(+15)")
-
-    # 2.3 Commercial Intent & Asset Description
-    # Commercial offer/recruitment pitch (продам канал, продам чат, ищу менеджеров по продажам)
-    has_commercial_pitch = bool(re.search(
-        r'\b(?:продам|продаю|прода[её]тся|скупаю|продажа|ищу\s+менеджер\w*|менеджер\w*\s+по\s+продажам)\b',
-        clean_text
-    ))
-    if has_commercial_pitch:
-        score += 25
-        factors.append("commercial_pitch(+25)")
-
-    # Asset specifiers (канал, чат, эро тематики, азартной тематики, казино, гемблинг, аккаунты, клики)
-    has_asset_specifiers = bool(re.search(
-        r'\b(?:канал[ыа]?|чат[ыа]?|сетку|базу|аккаунт[ыа]?|клики|тематик\w*|казино|гемблинг|азарт)\b',
-        clean_text
-    ))
-    if has_asset_specifiers:
-        score += 15
-        factors.append("asset_specifiers(+15)")
-
-    # Mass account lists with country flags
-    flag_count = sum(1 for flag in COUNTRY_FLAGS if flag in text)
-    if flag_count >= 3:
-        score += 35
-        factors.append(f"country_flags_{flag_count}(+35)")
-
-    # =========================================================================
-    # 3. CONVERSATIONAL DAMPENERS (Protect regular users)
-    #    Dampeners are capped and can never cancel structural evidence.
-    #    Uncapped subtraction used to zero out real advertisements whenever
-    #    three cheap signals overlapped (-80 against +75), which is how ordinary
-    #    replies to our own posts ended up silently cleared.
-    # =========================================================================
-    damp_points = 0
-
-    # A question mark without seller routing suggests inquiry, not advertising
-    has_q_mark = "?" in clean_text
-    if has_q_mark and not (has_emoji_contact or has_text_seller_contact):
-        damp_points += 25
-        factors.append("question_mark(-25)")
-
-    # Short single-line conversational messages (< 70 chars)
-    if len(clean_text) < 70 and len(raw_lines) == 1:
-        damp_points += 25
-        factors.append("short_single_line(-25)")
-
-    # Conversational speech markers (я, мне, мы, ты, тебе, привет, спасибо, ку)
-    conversational_markers = bool(re.search(
-        r'\b(?:я|мне|меня|мы|нас|ты|тебе|тебя|привет|ку|здравствуйте|спасибо|спс|лол|хах|хд|ладно|норм|почему|зачем)\b',
-        clean_text
-    ))
-    if conversational_markers and not (has_emoji_contact or bullet_lines >= 1):
-        damp_points += 15
-        factors.append("conversational_markers(-15)")
-
-    score = max(0, score - min(damp_points, 40))
-
-    # A real buyer inquiry outranks every heuristic: it is never advertising
-    if is_genuine_buyer_question(text) and not (has_emoji_contact or has_text_seller_contact):
-        score = 0
-        factors.append("genuine_buyer_question(veto)")
-
-    # Determine primary trigger
-    primary_trigger = factors[0] if factors else "low_score"
-    return score, primary_trigger, factors
-
-def is_spam_message(text: str, message: Any = None) -> Tuple[bool, str]:
-    if not text:
-        return False, ""
-
-    score, primary_trigger, factors = calculate_spam_score(text, message)
-    if score >= 50:
-        return True, f"{primary_trigger} (score={score})"
-    return False, ""
-
-def is_genuine_buyer_question(text: str) -> bool:
-    if not text:
-        return False
-    clean_text = text.lower().strip()
-
-    # Never consider a message a buyer question if it contains seller contact directing to another username
-    if re.search(r'(?:пишите|писать|связь|обращаться|отпишите)\s*[:\-—]?\s*@\w+|(?:📩|👉|📲|💬|✍️|✉️)\s*@\w+', clean_text):
-        return False
-
-    # Never consider catalog/product lists as buyer questions
-    if re.search(r'[1-9]️⃣|[①-⑩]', clean_text):
-        return False
-
-    # Never consider mass price lists as buyer questions
-    if sum(1 for flag in COUNTRY_FLAGS if flag in text) >= 2:
-        return False
-
-    has_q_mark = "?" in clean_text
-    buyer_triggers = [
-        r"\bпоч[её]м\b", r"\bцена\b", r"\bцену\b", r"\bпрайс\b", r"\bактуально\b",
-        r"\bсвободно\b", r"\bстат[уа]\b", r"\bстатистик[ау]\b", r"\bохват\b",
-        r"\bчекни\s+лс\b", r"\bответь(?:те)?\s+в\s+лс\b", r"\bкуплю\b", r"\bхочу\s+купить\b",
-        r"\bпродашь\b", r"\bпрода[её]шь\b", r"\bпрода[её]те\b",
-        r"\bможно\s+(?:купить|взять|разместить|заказать)\b",
-        r"\bместо\s+есть\b", r"\bесть\s+место\b"
-    ]
-    matches_buyer_trigger = any(re.search(p, clean_text) for p in buyer_triggers)
-
-    # Conversational questions are short (< 220 chars) and either have ? or clear buyer trigger phrase
-    if (has_q_mark or matches_buyer_trigger) and len(clean_text) < 220:
-        # If it's a broadcast offering goods for sale ("Продам каналы") or asking user to buy ("Купишь рекламу?"), it's not a buyer asking
-        if re.search(r'\b(?:продам|продаю|скупаю|продажа|купишь|купите)\s+(?:канал|чат|акк|сетк|групп|баз|бот|реклам)', clean_text):
-            return False
-        return True
-
-    return False
-
-def is_hard_spam(text: str, message: Any = None) -> Tuple[bool, str]:
-    """
-    Structural spam evidence strong enough to justify clearing on its own.
-    A human never produces these by accident: invisible ghost characters,
-    inline-bot posts and broadcaster watermarks.
-    """
-    if not text:
-        return False, ""
-    if message and getattr(message, "via_bot_id", None):
-        return True, "sent_via_inline_bot"
-    if re.search(r"[\u200b\u200c\u200e\u200f\u2060-\u206f\ufeff]", text):
-        return True, "invisible_ghost_ping"
+def _hard_evidence(text: str, message: Any = None) -> Optional[Tuple[str, str]]:
+    if message is not None and getattr(message, "via_bot_id", None):
+        return "sent_via_inline_bot", "inline_bot"
+    if _INVISIBLE_RE.search(text):
+        return "invisible_ghost_ping", "zero_width_ghost_chars"
+    ev = _entity_evidence(text, message)
+    if ev:
+        return ev
     clean = text.lower()
     for pat in SPAM_PATTERNS:
         if pat.search(clean):
-            return True, pat.pattern
+            return pat.pattern, "signature_match"
+    return None
+
+
+def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List[str]]:
+    """Returns (score, primary_trigger, matched_factors). Spam when score >= 50."""
+    if not text:
+        if message is not None and getattr(message, "via_bot_id", None):
+            return 100, "sent_via_inline_bot", ["inline_bot"]
+        return 0, "", []
+
+    hard = _hard_evidence(text, message)
+    if hard:
+        return 100, hard[0], [hard[1]]
+
+    clean = text.lower()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    factors: List[str] = []
+    score = 0
+
+    def add(points: int, label: str):
+        nonlocal score
+        score += points
+        factors.append(f"{label}(+{points})")
+
+    # --- commercial lexicon -------------------------------------------------
+    topic_points = 0
+    strong_topic = False
+    multi_hit_topic = False
+    for pat, pts, label in _SPAM_LEXICON:
+        hits = {m.group(0) for m in pat.finditer(clean)}
+        if not hits:
+            continue
+        if label in _STRONG_TOPICS:
+            strong_topic = True
+        extra = min(10 * (len(hits) - 1), 20)
+        if extra:
+            multi_hit_topic = True
+        topic_points += pts + extra
+        factors.append(f"topic_{label}(+{pts + extra})")
+    topic_points = min(topic_points, 50)
+    score += topic_points
+
+    has_sale_verb = bool(_SALE_VERB_RE.search(clean))
+    has_seller_ask = bool(_SELLER_ASK_RE.search(clean))
+    if has_sale_verb:
+        add(25, "sale_verb")
+    if has_seller_ask:
+        add(55, "seller_ask")
+
+    # --- contact routing ----------------------------------------------------
+    has_emoji_routing = bool(_EMOJI_ROUTING_RE.search(clean))
+    has_text_routing = bool(_ROUTING_RE.search(clean))
+    has_dm_cta = bool(_DM_CTA_RE.search(clean))
+    if has_emoji_routing:
+        add(30, "emoji_contact_routing")
+    elif has_text_routing:
+        add(25, "text_seller_routing")
+    if has_dm_cta and (topic_points or has_sale_verb or has_seller_ask):
+        add(15, "dm_call_to_action")
+
+    links = _LINK_RE.findall(clean)
+    if links:
+        add(25 if _PRIVATE_LINK_RE.search(clean) else 10, "promo_links")
+    handles = re.findall(r"@([a-zA-Z0-9_]{4,32})", text)
+    if len(handles) >= 2:
+        add(15, f"multiple_usernames_{len(handles)}")
+
+    prices = _PRICE_RE.findall(clean)
+    if len(prices) >= 2:
+        add(20, f"price_list_{len(prices)}")
+    elif prices and (topic_points or has_sale_verb):
+        add(10, "price")
+
+    flag_count = sum(1 for f in COUNTRY_FLAGS if f in text)
+    if flag_count >= 3:
+        add(35, f"country_flags_{flag_count}")
+
+    # --- layout -------------------------------------------------------------
+    banner = sum(1 for l in lines if _BANNER_RE.match(l))
+    if banner:
+        add(15 if banner == 1 else 25, "banner_emojis")
+    bullets = sum(1 for l in lines if _CATALOG_BULLET_RE.match(l))
+    if bullets:
+        add(10 if bullets == 1 else 25, "bullet_points")
+    if len(lines) >= 4:
+        add(15, "multiblock_layout")
+    if re.search(r"\b(?:канал[ыа]?|чат[ыа]?|групп[уыа]|сетк[уи]|баз[уы])\b", clean) and has_sale_verb:
+        add(15, "asset_specifiers")
+
+    commercial = bool(topic_points or has_sale_verb or has_seller_ask or has_emoji_routing or has_text_routing)
+    has_promo = bool(_PROMO_RE.search(clean))
+    combo = bool(topic_points) and (
+        has_sale_verb or has_seller_ask or has_emoji_routing or has_text_routing or has_dm_cta
+        or bool(links) or bool(prices) or has_promo or (strong_topic and multi_hit_topic)
+    )
+    if combo:
+        add(20, "commercial_combo")
+
+    # --- conversational dampeners (capped, never cancel commerce) ----------
+    damp = 0
+    if "?" in clean and not (has_emoji_routing or has_text_routing):
+        damp += 25
+        factors.append("question_mark(-25)")
+    if len(clean) < 70 and len(lines) == 1:
+        damp += 25
+        factors.append("short_single_line(-25)")
+    if _CONVO_RE.search(clean) and not (has_emoji_routing or bullets):
+        damp += 15
+        factors.append("conversational_markers(-15)")
+    if has_seller_ask or combo:
+        cap = 0
+    elif strong_topic:
+        cap = 10
+    elif commercial and score >= 70:
+        cap = 20
+    else:
+        cap = 40
+    score = max(0, score - min(damp, cap))
+
+    if is_genuine_buyer_question(text):
+        score = 0
+        factors.append("genuine_buyer_question(veto)")
+
+    return score, (factors[0] if factors else "low_score"), factors
+
+
+def is_spam_message(text: str, message: Any = None) -> Tuple[bool, str]:
+    score, trigger, _ = calculate_spam_score(text or "", message)
+    if score >= SPAM_THRESHOLD:
+        return True, f"{trigger} (score={score})"
     return False, ""
+
+
+def is_genuine_buyer_question(text: str) -> bool:
+    """A short question from someone who wants to BUY from us. Never spam."""
+    if not text:
+        return False
+    clean = text.lower().strip()
+    if len(clean) >= 220 or _INVISIBLE_RE.search(text):
+        return False
+    if _ROUTING_RE.search(clean) or _EMOJI_ROUTING_RE.search(clean):
+        return False
+    if _LINK_RE.search(clean) or re.search(r"[1-9]️⃣|[①-⑩]", clean):
+        return False
+    if sum(1 for f in COUNTRY_FLAGS if f in text) >= 2:
+        return False
+    if _SELLER_ASK_RE.search(clean):
+        return False
+    if re.search(r"\b(?:продам|продаю|скупаю|скупка|продажа|куплю\s+(?:зв|акк|тон|нфт|голд))", clean):
+        return False
+    if sum(1 for pat, _p, _l in _SPAM_LEXICON if pat.search(clean)) >= 2:
+        return False
+    has_q = "?" in clean
+    has_trigger = any(p.search(clean) for p in BUYER_PATTERNS)
+    if has_trigger and (has_q or len(clean) < 120):
+        return True
+    # A bare short question about ads/our channel ("а сколько?", "есть место?")
+    if has_q and len(clean) < 120 and not any(pat.search(clean) for pat, _p, _l in _SPAM_LEXICON):
+        return bool(re.search(r"\b(?:реклам\w*|пост\w*|канал\w*|чат\w*|размещ\w*|закреп\w*|стоит|цен\w*)\b", clean))
+    return False
+
+
+def is_hard_spam(text: str, message: Any = None) -> Tuple[bool, str]:
+    """Structural evidence a human never produces by accident."""
+    if not text and not (message is not None and getattr(message, "via_bot_id", None)):
+        return False, ""
+    hard = _hard_evidence(text or "", message)
+    return (True, hard[0]) if hard else (False, "")
+
 
 def should_auto_read(text: str, message: Any = None, is_ping: Optional[bool] = None) -> bool:
     """
     Auto-clear gate.
 
-    is_ping reports whether the message actually reached us (mention, reply to
-    our own post, or our handle in the body). Hard spam is always cleared;
-    heuristic advertising is cleared only when the message pinged us. An
-    ordinary message in a chat we happen to read therefore stays untouched.
-
-    is_ping=None keeps the legacy "judge the text alone" behaviour for callers
-    that carry no ping context.
+    Hard structural spam is always cleared. Heuristic advertising is cleared
+    only when it pinged us (is_ping=True) or no ping context was given. A real
+    buyer question is never cleared.
     """
-    if is_genuine_buyer_question(text):
-        return False
-
     hard, _ = is_hard_spam(text, message)
     if hard:
         return True
-
+    if is_genuine_buyer_question(text):
+        return False
     if is_ping is False:
         return False
-
     return is_spam_message(text, message)[0]
 
 def is_gatekeeper_text(text: str) -> bool:
@@ -1801,6 +1837,21 @@ def extract_payload_and_entities(message: Any, raw_text: str, folder_name: str =
                         pass
         return text, out_entities
 
+async def fetch_album(client: TelegramClient, message: Any) -> List[Any]:
+    """All parts of the album `message` belongs to, sorted, without duplicates."""
+    gid = getattr(message, "grouped_id", None)
+    if not gid:
+        return [message]
+    around = list(range(max(1, message.id - 10), message.id + 11))
+    try:
+        found = await client.get_messages(message.chat_id, ids=around)
+    except Exception:
+        found = []
+    album = {m.id: m for m in (found or []) if m is not None and getattr(m, "grouped_id", None) == gid}
+    album.setdefault(message.id, message)
+    return [album[k] for k in sorted(album)][:10]
+
+
 async def save_media_from_message(
     client: TelegramClient,
     message: Any,
@@ -1816,12 +1867,7 @@ async def save_media_from_message(
 
     saved_paths = []
     if getattr(message, "grouped_id", None):
-        album_messages = []
-        async for m in client.iter_messages(message.chat_id, limit=20):
-            if getattr(m, "grouped_id", None) == message.grouped_id:
-                album_messages.append(m)
-        album_messages.sort(key=lambda x: x.id)
-
+        album_messages = await fetch_album(client, message)
         for idx, m in enumerate(album_messages):
             if m.media:
                 file_path = await client.download_media(m, file=str(target_dir / f"item_{item_index}_{idx}"))
@@ -1881,30 +1927,19 @@ async def send_broadcast_post(
 ):
     if bundle:
         clean_bundle = [item for item in bundle if not is_internal_bot_message(item.get("text", ""))]
+        sent_items = 0
         for idx, item in enumerate(clean_bundle):
             if idx > 0:
                 await asyncio.sleep(1.0)
-
-            if item.get("is_forward") and item.get("forward_chat_id") and item.get("forward_msg_ids"):
-                try:
-                    await client.forward_messages(
-                        chat_peer,
-                        messages=item["forward_msg_ids"],
-                        from_peer=item["forward_chat_id"]
-                    )
-                    continue
-                except (errors.SlowModeWaitError, errors.FloodWaitError, errors.UserBannedInChannelError, errors.ChannelPrivateError, errors.ChatWriteForbiddenError, asyncio.CancelledError):
-                    raise
-                except Exception as e:
-                    print(f"[WARN] Не удалось переслать сообщение: {e}. Отправляю сохраненную копию.")
-
-            await send_single_item(
-                client,
-                chat_peer,
-                text=item.get("text", ""),
-                entities_hex=item.get("entities_hex", []),
-                media_files=item.get("media_files", [])
-            )
+            try:
+                await _send_bundle_item(client, chat_peer, item)
+                sent_items += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if sent_items:
+                    raise PartialSendError(sent_items, e) from e
+                raise
     else:
         if is_internal_bot_message(text):
             return
@@ -1915,6 +1950,32 @@ async def send_broadcast_post(
             entities_hex=entities_hex or [],
             media_files=media_files or []
         )
+
+
+async def _send_bundle_item(client: TelegramClient, chat_peer: Any, item: Dict[str, Any]):
+    if item.get("is_forward") and item.get("forward_chat_id") and item.get("forward_msg_ids"):
+        try:
+            await client.forward_messages(
+                chat_peer,
+                messages=item["forward_msg_ids"],
+                from_peer=item["forward_chat_id"]
+            )
+            return
+        except (errors.SlowModeWaitError, errors.FloodWaitError, errors.UserBannedInChannelError,
+                errors.ChannelPrivateError, errors.ChatWriteForbiddenError, asyncio.CancelledError,
+                ConnectionError, OSError, asyncio.TimeoutError):
+            raise
+        except Exception as e:
+            log_error(f"[WARN] Не удалось переслать сообщение: {e}. Отправляю сохранённую копию.")
+
+    await send_single_item(
+        client,
+        chat_peer,
+        text=item.get("text", ""),
+        entities_hex=item.get("entities_hex", []),
+        media_files=item.get("media_files", [])
+    )
+
 
 def _extract_folder_title(dialog_filter: Any) -> str:
     if hasattr(dialog_filter, "title"):
@@ -2084,167 +2145,195 @@ async def join_and_silence_target(
     return False
 
 
-async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: Any):
-    """
-    Clear an advertisement that reached us: mark it read, then drop the mention and
-    reaction badges.
+# Highest message id of a *genuine* ping (real reply / mention from a person)
+# per (account, chat). Used so that clearing a spam ping never marks a real,
+# still-unread reply as read.
+_GENUINE_PINGS: Dict[Tuple[int, int], int] = {}
 
-    Ordering is the whole point of this function. The original version ran the
-    mention clear, then the reaction clear, then the history read, then the high
-    level acknowledge as four sequential round-trips. Telegram renders the push
-    notification from the incoming update itself, so the phone had already lit up
-    long before the history read fired, which is why ad notifications kept
-    arriving despite the script "catching" the ad. The history read now goes first
-    and the mention and reaction clears run concurrently behind it.
-    """
-    from telethon.tl.types import (
-        TypeInputPeer,
-        InputPeerChannel,
-        InputPeerChat,
-        InputPeerUser,
-        InputChannel,
-    )
-    from telethon.tl.functions.messages import ReadHistoryRequest as MessagesReadHistoryRequest
-    from telethon.tl.functions.channels import ReadHistoryRequest as ChannelReadHistoryRequest
-    from telethon.tl.functions.messages import ReadReactionsRequest
 
-    input_peer = None
-    if isinstance(chat_peer, (TypeInputPeer, InputPeerChannel, InputPeerChat, InputPeerUser)):
-        input_peer = chat_peer
-    elif hasattr(message, "get_input_chat"):
+def note_genuine_ping(account_id: int, chat_id: int, msg_id: int):
+    key = (account_id, chat_id)
+    if msg_id and msg_id > _GENUINE_PINGS.get(key, 0):
+        _GENUINE_PINGS[key] = msg_id
+    if len(_GENUINE_PINGS) > 5000:
+        for k in list(_GENUINE_PINGS)[:1000]:
+            _GENUINE_PINGS.pop(k, None)
+
+
+async def _resolve_input_peer(client: TelegramClient, chat_peer: Any, message: Any):
+    from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser, InputPeerSelf
+    if isinstance(chat_peer, (InputPeerChannel, InputPeerChat, InputPeerUser, InputPeerSelf)):
+        return chat_peer
+    if message is not None and hasattr(message, "get_input_chat"):
         try:
-            input_peer = await message.get_input_chat()
+            peer = await message.get_input_chat()
+            if peer:
+                return peer
         except Exception:
             pass
-
-    if not input_peer and getattr(message, "input_chat", None):
-        input_peer = message.input_chat
-
-    if not input_peer:
-        try:
-            input_peer = await client.get_input_entity(chat_peer)
-        except Exception:
-            try:
-                input_peer = await client.get_entity(chat_peer)
-            except Exception:
-                pass
-
-    # A bare chat id with no resolvable peer must still be actionable: bailing out
-    # here left the badge untouched, which is exactly how ad notifications
-    # survived the clear.
-    if not input_peer:
-        try:
-            input_peer = int(chat_peer)
-        except Exception:
-            return
-
-    msg_id = getattr(message, "id", 0)
-
-    # Forum topic detection: the badge lives on the topic, not the chat
-    reply_to = getattr(message, "reply_to", None)
-    top_id = getattr(reply_to, "reply_to_top_id", None)
-    if not top_id and getattr(reply_to, "forum_topic", False):
-        top_id = getattr(reply_to, "reply_to_msg_id", None)
-
-    # 1. History read first. This is the request that stops the notification.
-    if msg_id:
-        try:
-            if isinstance(input_peer, (InputPeerChannel, InputChannel)):
-                input_chan = utils.get_input_channel(input_peer)
-                await client(ChannelReadHistoryRequest(channel=input_chan, max_id=msg_id))
-            else:
-                await client(MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id))
-        except Exception:
-            pass
-
-    # 2. Mention and reaction clears are independent of each other and of the
-    #    read above, so they run concurrently instead of in sequence.
-    async def _clear_mentions():
-        try:
-            if top_id:
-                await client(ReadMentionsRequest(peer=input_peer, top_msg_id=top_id))
-            await client(ReadMentionsRequest(peer=input_peer))
-        except Exception:
-            pass
-
-    async def _clear_reactions():
-        try:
-            if top_id:
-                await client(ReadReactionsRequest(peer=input_peer, top_msg_id=top_id))
-            await client(ReadReactionsRequest(peer=input_peer))
-        except Exception:
-            pass
-
-    await asyncio.gather(_clear_mentions(), _clear_reactions(), return_exceptions=True)
-
-    # 3. Final acknowledge keeps Telethon's own bookkeeping in sync.
+    if getattr(message, "input_chat", None):
+        return message.input_chat
     try:
-        await client.send_read_acknowledge(
-            input_peer,
-            max_id=msg_id,
-            clear_mentions=False,
-            clear_reactions=False,
-        )
+        return await client.get_input_entity(chat_peer)
+    except Exception:
+        return None
+
+
+async def clear_spam_mention(
+    client: TelegramClient,
+    chat_peer: Any,
+    message: Any,
+    account_id: int = 0,
+    chat_id: Optional[int] = None,
+):
+    """
+    Silence one spam ping that reached us.
+
+    1. Mark *only this message's* mention as read (readMessageContents). The
+       old code called ReadMentions for the whole chat, which also wiped real
+       mentions from people, and ReadReactions, which wiped real reactions.
+    2. Read the chat history up to the spam message so the push notification
+       disappears, but only when no genuine ping in that chat is still unread.
+    """
+    from telethon.tl.types import InputPeerChannel
+    from telethon.tl.functions.messages import (
+        ReadHistoryRequest as MessagesReadHistoryRequest,
+        ReadMessageContentsRequest as MessagesReadContentsRequest,
+        GetPeerDialogsRequest,
+    )
+    from telethon.tl.functions.channels import (
+        ReadHistoryRequest as ChannelReadHistoryRequest,
+        ReadMessageContentsRequest as ChannelReadContentsRequest,
+    )
+    from telethon.tl.types import InputDialogPeer
+
+    msg_id = getattr(message, "id", 0) or 0
+    if not msg_id:
+        return
+    input_peer = await _resolve_input_peer(client, chat_peer, message)
+    if input_peer is None:
+        return
+    is_channel = isinstance(input_peer, InputPeerChannel)
+
+    try:
+        if is_channel:
+            await client(ChannelReadContentsRequest(channel=utils.get_input_channel(input_peer), id=[msg_id]))
+        else:
+            await client(MessagesReadContentsRequest(id=[msg_id]))
     except Exception:
         pass
+
+    # Is a real ping in this chat still unread? Then leave the history alone.
+    key_chat = chat_id if chat_id is not None else getattr(message, "chat_id", None)
+    pending_real = _GENUINE_PINGS.get((account_id, key_chat), 0) if key_chat is not None else 0
+    if pending_real and pending_real < msg_id:
+        try:
+            res = await client(GetPeerDialogsRequest(peers=[InputDialogPeer(peer=input_peer)]))
+            read_max = res.dialogs[0].read_inbox_max_id if getattr(res, "dialogs", None) else 0
+        except Exception:
+            read_max = 0
+        if pending_real > read_max:
+            return
+        _GENUINE_PINGS.pop((account_id, key_chat), None)
+
+    try:
+        if is_channel:
+            await client(ChannelReadHistoryRequest(channel=utils.get_input_channel(input_peer), max_id=msg_id))
+        else:
+            await client(MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id))
+    except Exception:
+        pass
+
+
+class PartialSendError(Exception):
+    """Some items of a multi-message post were delivered before an error."""
+
+    def __init__(self, sent_items: int, original: BaseException):
+        super().__init__(f"{sent_items} item(s) sent before: {original!r}")
+        self.sent_items = sent_items
+        self.original = original
+
+
+# Errors after which the server definitely did NOT publish our message.
+_DEFINITE_NOT_SENT = (
+    errors.SlowModeWaitError,
+    errors.FloodWaitError,
+    errors.ChatWriteForbiddenError,
+    errors.UserBannedInChannelError,
+    errors.ChannelPrivateError,
+)
+
+# Telegram user ids of every account running in this process. Messages from
+# our own accounts must never advance a counter, otherwise two accounts in the
+# same chat keep triggering each other forever.
+OWN_ACCOUNT_IDS: Set[int] = set()
 
 
 class BroadcasterService:
     _ACTIVE_INSTANCES: Dict[int, 'BroadcasterService'] = {}
     FOLDER_SYNC_INTERVAL = 60.0
+    RETRY_DELAY = 30.0          # seconds before retrying a definitely-failed send
+    PAUSE_BETWEEN_CHATS = 1.5   # anti-flood pause between different chats
 
     def __init__(self, client: TelegramClient, account_id: int = 0):
         self.client = client
         self.account_id = account_id
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
+        self._chat_locks: Dict[int, asyncio.Lock] = {}
         self._sending_chats: Set[int] = set()
         self._last_sent_chat: Dict[int, float] = {}
+        self._flood_until = 0.0
         self._folder_cache: Dict[Tuple[str, str], Tuple[float, List[int]]] = {}
         self._last_folder_log: Dict[Tuple[str, str], float] = {}
+        self._bg_tasks: Set[asyncio.Task] = set()
 
+    # ------------------------------------------------------------------ life
     def start(self):
-        # Stop any previous active instance for this account to prevent duplicate background loops
         old = BroadcasterService._ACTIVE_INSTANCES.get(self.account_id)
         if old and old is not self:
-            log_info(f"[LIFECYCLE] Остановка предыдущего экземпляра BroadcasterService для аккаунта {self.account_id}")
             old.stop()
         BroadcasterService._ACTIVE_INSTANCES[self.account_id] = self
+        if self.account_id:
+            OWN_ACCOUNT_IDS.add(int(self.account_id))
+            try:
+                db.adopt_legacy_rows(self.account_id)
+            except Exception as e:
+                log_error(f"[DB] Не удалось привязать старые рассылки к аккаунту: {e}")
 
         if self.is_running and self._task and not self._task.done():
-            log_info(f"[LIFECYCLE] BroadcasterService уже запущен для аккаунта {self.account_id}.")
             return
         self.is_running = True
         try:
             loop = asyncio.get_running_loop()
-            self._task = loop.create_task(self._loop())
         except RuntimeError:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    self._task = loop.create_task(self._loop())
-            except Exception:
-                pass
+            loop = None
+        if loop is not None:
+            self._task = loop.create_task(self._loop())
 
     def stop(self):
         self.is_running = False
         if self._task and not self._task.done():
             self._task.cancel()
+        for t in list(self._bg_tasks):
+            if not t.done():
+                t.cancel()
+        self._bg_tasks.clear()
         self._sending_chats.clear()
         self._folder_cache.clear()
         if BroadcasterService._ACTIVE_INSTANCES.get(self.account_id) is self:
             BroadcasterService._ACTIVE_INSTANCES.pop(self.account_id, None)
 
-    async def sync_folder_broadcasts(self) -> int:
-        """
-        Reconcile every active folder broadcast against the live folder contents.
+    def _chat_lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[chat_id] = lock
+        return lock
 
-        Chats added to a folder while a broadcast is already running were never
-        enrolled: folder_name was read exactly once, when the broadcast was
-        created, and only already-materialised tasks were ever scheduled. This
-        walks each registered folder, enrols chats that appeared, and parks tasks
-        for chats that were removed from the folder.
-        """
+    # --------------------------------------------------------------- folders
+    async def sync_folder_broadcasts(self) -> int:
+        """Enrol chats that appeared in a folder, park chats that left it."""
         folder_broadcasts = db.get_active_folder_broadcasts(account_id=self.account_id)
         if not folder_broadcasts:
             return 0
@@ -2262,37 +2351,28 @@ class BroadcasterService:
             except Exception as e:
                 log_error(f"[FOLDER] Не удалось прочитать папку \"{folder_name}\": {e}")
                 continue
-
             if not live_chats:
                 continue
 
             live_set = set(live_chats)
-            previous = self._folder_cache.get(cache_key)
-            previous_set = set(previous[1]) if previous else set()
-
-            # The database is the source of truth for enrolment. Diffing the
-            # in-memory snapshot alone missed chats that were enrolled before the
-            # process restarted, and a cold cache made the first pass a no-op.
             enrolled_set = db.get_enrolled_chat_ids(template_name, folder_name, account_id=self.account_id)
             added = live_set - enrolled_set
             removed = enrolled_set - live_set
 
             for cid in sorted(added):
                 try:
-                    created = db.ensure_broadcast_task(
+                    if db.ensure_broadcast_task(
                         account_id=self.account_id,
                         chat_id=cid,
                         template_name=template_name,
                         mode=fb.get("mode") or "interval",
                         interval_seconds=fb.get("interval_seconds") or 0,
                         counter_threshold=fb.get("counter_threshold") or 0,
-                        folder_name=folder_name
-                    )
-                    if created:
+                        folder_name=folder_name,
+                    ):
                         enrolled_total += 1
                 except Exception as e:
                     log_error(f"[FOLDER] Не удалось добавить чат {cid} в рассылку \"{template_name}\": {e}")
-                    continue
 
             for cid in sorted(removed):
                 try:
@@ -2301,24 +2381,16 @@ class BroadcasterService:
                     log_error(f"[FOLDER] Не удалось снять чат {cid} с рассылки \"{template_name}\": {e}")
 
             self._folder_cache[cache_key] = (time.time(), list(live_chats))
-
             if added or removed:
                 last_log = self._last_folder_log.get(cache_key, 0.0)
                 if time.time() - last_log > 60.0:
                     self._last_folder_log[cache_key] = time.time()
-                    if added:
-                        log_info(
-                            f"[FOLDER] Рассылка \"{template_name}\" (\"{folder_name}\"): "
-                            f"+{len(added)} новых чатов, всего {len(live_set)}"
-                        )
-                    if removed:
-                        log_info(
-                            f"[FOLDER] Рассылка \"{template_name}\" (\"{folder_name}\"): "
-                            f"-{len(removed)} чатов убрано из папки, осталось {len(live_set)}"
-                        )
-
+                    log_info(
+                        f"[FOLDER] \"{template_name}\" (\"{folder_name}\"): +{len(added)} / -{len(removed)}, всего {len(live_set)}"
+                    )
         return enrolled_total
 
+    # ------------------------------------------------------------ scheduler
     async def _loop(self):
         import gc
         last_gc = time.time()
@@ -2328,174 +2400,160 @@ class BroadcasterService:
         while self.is_running:
             try:
                 now = time.time()
-
-                # Clean expired collector sessions every 30s instead of every second
                 if now - last_collector_clean > 30:
-                    expired = [k for k, s in ACTIVE_COLLECTORS.items() if now - s.get("last_active", 0) > 300]
-                    for k in expired:
+                    for k in [k for k, s in ACTIVE_COLLECTORS.items() if now - s.get("last_active", 0) > 300]:
                         ACTIVE_COLLECTORS.pop(k, None)
                     last_collector_clean = now
-
-                # Periodic memory cleanup for mobile (every 10 minutes)
                 if now - last_gc > 600:
                     gc.collect()
                     last_gc = now
-
-                # Re-resolve every folder-backed broadcast on a fixed cadence so
-                # chats added to a folder after the broadcast was created are
-                # picked up automatically instead of waiting for a restart.
                 if now - last_folder_sync >= self.FOLDER_SYNC_INTERVAL:
-                    await self.sync_folder_broadcasts()
                     last_folder_sync = now
+                    try:
+                        await self.sync_folder_broadcasts()
+                    except Exception as e:
+                        log_error(f"[FOLDER] Ошибка синхронизации папок: {e}")
 
-                tasks = db.get_active_interval_tasks(account_id=self.account_id)
-                for task in tasks:
-                    mode = task.get("mode", "interval")
-                    last_sent = task.get("last_sent_at", 0)
-                    interval = task.get("interval_seconds", 0)
-                    chat_id = task["chat_id"]
+                if now < self._flood_until:
+                    await asyncio.sleep(min(5.0, self._flood_until - now))
+                    continue
 
-                    # Skip if chat is currently in-flight
-                    if chat_id in self._sending_chats:
-                        continue
+                for task in db.get_active_interval_tasks(account_id=self.account_id):
+                    if not self.is_running:
+                        break
+                    if time.time() < self._flood_until:
+                        break
+                    sent = await self._run_scheduled(task)
+                    if sent:
+                        await asyncio.sleep(self.PAUSE_BETWEEN_CHATS)
 
-                    if mode == "hybrid":
-                        current_count = task.get("current_count", 0)
-                        threshold = task.get("counter_threshold", 1)
-                        if (now - last_sent >= interval) and (current_count >= threshold):
-                            template_name = task["template_name"]
-
-                            rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
-                            effective_name = rotation_tpl if rotation_tpl else template_name
-
-                            # ATOMIC PRE-RESET: atomically reset count and update last_sent_at before network I/O
-                            # so handle_counter_event does not trigger simultaneously during send_broadcast_post
-                            db.reset_hybrid_task(task["id"])
-
-                            log_info(f"[HYBRID] Чат {chat_id}: набрано {current_count}/{threshold} соо и прошло {interval}с. Отправляю '{effective_name}'...")
-                            success = await self._send_task(task["id"], chat_id, effective_name, task=task)
-                            if not success:
-                                db.restore_counter(task["id"], threshold, last_sent_at=now - interval + 15)
-                            await asyncio.sleep(1.5)
-                    else:
-                        if now - last_sent >= interval:
-                            template_name = task["template_name"]
-
-                            rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
-                            effective_name = rotation_tpl if rotation_tpl else template_name
-
-                            success = await self._send_task(task["id"], chat_id, effective_name, task=task)
-                            if success:
-                                db.update_task_last_sent(task["id"])
-                            else:
-                                with db._conn() as conn:
-                                    conn.execute(
-                                        "UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?",
-                                        (now - interval + 15, task["id"])
-                                    )
-                            # Small delay between different chats in interval batch to avoid flood ban
-                            await asyncio.sleep(1.5)
-
-                # Dynamic sleep to prevent CPU/battery drain on phone:
-                # If there are no interval/hybrid tasks, sleep 5.0 seconds.
-                # If tasks exist, sleep dynamically up to 5.0 seconds based on when the next task is due.
-                if not tasks:
-                    await asyncio.sleep(5.0)
-                else:
-                    min_wait = 5.0
-                    for task in tasks:
-                        interval = task.get("interval_seconds", 0)
-                        last_sent = task.get("last_sent_at", 0)
-                        time_left = interval - (time.time() - last_sent)
-                        if time_left <= 0:
-                            min_wait = 1.0
-                            break
-                        else:
-                            min_wait = min(min_wait, time_left)
-                    await asyncio.sleep(max(1.0, min(min_wait, 5.0)))
-
+                await asyncio.sleep(self._next_wake())
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as e:
+                log_error(f"[LOOP] Ошибка планировщика: {type(e).__name__}: {e}")
                 await asyncio.sleep(3.0)
 
+    def _next_wake(self) -> float:
+        try:
+            tasks = db.get_active_interval_tasks(account_id=self.account_id)
+        except Exception:
+            return 5.0
+        wait = 5.0
+        now = time.time()
+        for t in tasks:
+            left = (t.get("interval_seconds") or 0) - (now - (t.get("last_sent_at") or 0))
+            wait = min(wait, max(left, 0.0))
+        return max(1.0, wait)
+
+    async def _run_scheduled(self, task: Dict[str, Any]) -> bool:
+        """Claim a due interval/hybrid task atomically, then send it."""
+        mode = task.get("mode", "interval")
+        if mode == "hybrid":
+            claimed = db.claim_hybrid_task(task["id"], time.time())
+        else:
+            claimed = db.claim_interval_task(task["id"], time.time())
+        if not claimed:
+            return False
+        return await self._deliver(task)
+
+    # -------------------------------------------------------------- counter
+    def on_incoming_message(self, chat_id: int):
+        """Called from the event handler. Never blocks update processing."""
+        t = asyncio.ensure_future(self.handle_counter_event(chat_id))
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+
     async def handle_counter_event(self, chat_id: int):
-        # Skip counter event check if chat is already in-flight sending
-        if chat_id in self._sending_chats:
-            log_info(f"[DEDUP] Чат {chat_id}: пропуск события счетчика (отправка уже в процессе).")
-            return
+        # increment_and_check_counter() resets the counter in the same
+        # statement that reports it ready, so a task can only be claimed once.
+        for task in db.increment_and_check_counter(chat_id, account_id=self.account_id):
+            await self._deliver(task)
 
-        ready_tasks = db.increment_and_check_counter(chat_id, account_id=self.account_id)
-        for task in ready_tasks:
-            template_name = task["template_name"]
-            rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
-            effective_name = rotation_tpl if rotation_tpl else template_name
+    # ---------------------------------------------------------------- send
+    async def _deliver(self, task: Dict[str, Any]) -> bool:
+        chat_id = task["chat_id"]
+        template_name = task["template_name"]
+        rotation_tpl = db.get_next_rotation_template(chat_id, account_id=self.account_id, rotation_name=template_name)
+        effective_name = rotation_tpl or template_name
 
-            mode_label = "ГИБРИД" if task.get("mode") == "hybrid" else "СЧЕТЧИК"
-            log_info(f"[{mode_label}] Чат {chat_id}: условие выполнено ({task['counter_threshold']} соо). Отправляю пост '{effective_name}'...")
-            success = await self._send_task(task["id"], chat_id, effective_name, task=task)
-            if not success:
-                db.restore_counter(task["id"], task["counter_threshold"])
+        outcome = await self._send_task(task["id"], chat_id, effective_name, task=task)
+        if outcome == "retry":
+            db.schedule_retry(task, delay=self.RETRY_DELAY)
+        return outcome == "sent"
 
-    async def _send_task(self, task_id: int, chat_id: int, template_name: str, task: Optional[Dict[str, Any]] = None) -> bool:
+    async def _send_task(self, task_id: int, chat_id: int, template_name: str, task: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Returns "sent", "retry" (server rejected it, try again later) or "skip".
+
+        A network error in the middle of a send is ambiguous: Telegram may well
+        have published the message already. Those are treated as sent, because
+        resending them is exactly how one scheduled post turned into two.
+        """
         template = db.get_template(template_name)
         if not template:
-            log_error(f"[ERROR] Шаблон '{template_name}' не найден в базе данных")
-            return False
+            log_error(f"[ERROR] Шаблон '{template_name}' не найден")
+            return "skip"
 
-        # --- DEDUPLICATION GUARD 1: In-flight chat lock ---
-        if chat_id in self._sending_chats:
-            log_info(f"[DEDUP] Чат {chat_id}: отправка уже выполняется! Блокирую параллельный дубликат.")
-            return False
+        lock = self._chat_lock(chat_id)
+        if lock.locked():
+            log_info(f"[DEDUP] Чат {chat_id}: отправка уже идёт, дубликат пропущен.")
+            return "skip"
 
-        # --- DEDUPLICATION GUARD 2: Cooldown debounce per chat (minimum 4.0s between broadcasts) ---
-        now_ts = time.time()
-        last_sent_ts = self._last_sent_chat.get(chat_id, 0.0)
-        if (now_ts - last_sent_ts) < 4.0:
-            log_info(f"[DEBOUNCE] Чат {chat_id}: прошло всего {now_ts - last_sent_ts:.1f}с с прошлой отправки. Блокирую дубликат.")
-            return False
-
-        self._sending_chats.add(chat_id)
-        try:
+        async with lock:
+            self._sending_chats.add(chat_id)
             try:
-                peer = await self.client.get_input_entity(chat_id)
-            except Exception:
-                peer = await self.client.get_entity(chat_id)
-            await send_broadcast_post(
-                self.client,
-                peer,
-                text=template["text"],
-                entities_hex=template["entities_hex"],
-                media_files=template["media_files"],
-                bundle=template.get("bundle")
-            )
-            self._last_sent_chat[chat_id] = time.time()
-            return True
-        except errors.SlowModeWaitError as e:
-            log_error(f"[SLOWMODE] Медленный режим в чате {chat_id}: нужно подождать {e.seconds}с")
-            if task and task.get("mode") in ("interval", "hybrid"):
                 try:
-                    with db._conn() as conn:
-                        conn.execute("UPDATE broadcast_tasks SET last_sent_at = ? WHERE id = ?", (time.time() - task.get("interval_seconds", 0) + e.seconds + 2, task_id))
+                    peer = await self.client.get_input_entity(chat_id)
                 except Exception:
-                    pass
-            return False
-        except errors.FloodWaitError as e:
-            log_error(f"[FLOOD] Задержка FloodWait {e.seconds}с в чате {chat_id}")
-            await asyncio.sleep(min(e.seconds + 1, 60))
-            return False
-        except (errors.UserBannedInChannelError, errors.ChannelPrivateError) as e:
-            log_error(f"[PERM] Аккаунт удален/забанен в чате {chat_id} ({type(e).__name__}). Рассылка отключена.")
-            db.set_broadcast_status(name=template_name, chat_id=chat_id, is_active=0, account_id=self.account_id)
-            return False
-        except errors.ChatWriteForbiddenError as e:
-            log_error(f"[RESTRICT] Чат {chat_id}: отправка временно ограничена администрацией ({e}). Рассылка не отключена, повтор позже.")
-            return False
-        except Exception as e:
-            log_error(f"[ERROR] Ошибка отправки рассылки в чат {chat_id}: {e}")
-            return False
-        finally:
-            self._sending_chats.discard(chat_id)
+                    peer = await self.client.get_entity(chat_id)
+                await send_broadcast_post(
+                    self.client,
+                    peer,
+                    text=template["text"],
+                    entities_hex=template["entities_hex"],
+                    media_files=template["media_files"],
+                    bundle=template.get("bundle"),
+                )
+                self._last_sent_chat[chat_id] = time.time()
+                return "sent"
+            except PartialSendError as e:
+                log_error(f"[PARTIAL] Чат {chat_id}: отправлено {e.sent_items} из пачки, остаток пропущен ({e.original}).")
+                self._last_sent_chat[chat_id] = time.time()
+                return "sent"
+            except errors.SlowModeWaitError as e:
+                log_error(f"[SLOWMODE] Чат {chat_id}: медленный режим, ждать {e.seconds}с")
+                if task is not None:
+                    db.schedule_retry(task, delay=e.seconds + 2)
+                return "skip"
+            except errors.FloodWaitError as e:
+                log_error(f"[FLOOD] FloodWait {e.seconds}с (чат {chat_id}) — пауза всех отправок аккаунта")
+                self._flood_until = time.time() + e.seconds + 1
+                if task is not None:
+                    db.schedule_retry(task, delay=e.seconds + 2)
+                return "skip"
+            except (errors.UserBannedInChannelError, errors.ChannelPrivateError) as e:
+                log_error(f"[PERM] Нет доступа к чату {chat_id} ({type(e).__name__}). Рассылка в нём отключена.")
+                db.deactivate_task(task_id)
+                return "skip"
+            except errors.ChatWriteForbiddenError:
+                log_error(f"[RESTRICT] Чат {chat_id}: писать запрещено, повтор позже.")
+                if task is not None:
+                    db.schedule_retry(task, delay=600)
+                return "skip"
+            except errors.RPCError as e:
+                log_error(f"[ERROR] Telegram отклонил отправку в чат {chat_id}: {e}")
+                return "retry"
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                log_error(f"[NET] Чат {chat_id}: связь оборвалась во время отправки ({e}). Не повторяю, чтобы не было дубля.")
+                return "sent"
+            except Exception as e:
+                log_error(f"[ERROR] Ошибка отправки в чат {chat_id}: {type(e).__name__}: {e}")
+                return "retry"
+            finally:
+                self._sending_chats.discard(chat_id)
 
 HELP_TEXT = """
 **⚙️ Управление юзерботом**
@@ -2550,9 +2608,10 @@ HELP_TEXT = """
 • `.просмотр все` / `.view all` — список всех рассылок и чередований в этом чате
 
 **8. Антиспам и авто-подписка:**
-• Моментально гасит спам-пинги и пуши на телефон от скупов и авто-ботов.
+• Гасит только те спам-сообщения, которые **пинганули тебя** (упоминание, ответ на твой пост, скрытый тег). Обычная реклама в чате не трогается.
+• Снимается только пинг этого спам-сообщения. Если в чате есть непрочитанный ответ от живого человека, он остаётся непрочитанным.
+• Ловит скупку/продажу звёзд, TON, NFT-подарков, аккаунтов, «заработок», казино, накрутку, скрытые теги и вотермарки автопостеров.
 • Автоматически вступает в каналы/боты по требованию капчи админов, мьютит их и убирает в папку `автосабнутое`.
-* Обычные ответы в чате больше не помечаются прочитанными — автогашение работает только по реальным пингам.
 
 **9. Заглушение конкретных людей:**
 * `.мутить` — ответьте командой на сообщение (самый точный способ)
@@ -2788,10 +2847,10 @@ class MessageDedupRing:
     """O(1) ring buffer for message deduplication across reconnects and burst updates."""
     def __init__(self, maxsize: int = 2000):
         self.maxsize = maxsize
-        self._deque: Deque[Tuple[int, int]] = collections.deque()
-        self._set: Set[Tuple[int, int]] = set()
+        self._deque: Deque[Tuple[Any, int]] = collections.deque()
+        self._set: Set[Tuple[Any, int]] = set()
 
-    def check_and_add(self, chat_id: int, msg_id: int) -> bool:
+    def check_and_add(self, chat_id: Any, msg_id: int) -> bool:
         """Returns True if already seen (duplicate), False if new."""
         key = (chat_id, msg_id)
         if key in self._set:
@@ -2832,58 +2891,54 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         chat_id = event.chat_id
         msg_id = getattr(event, "id", None)
         if msg_id and chat_id:
-            if _GLOBAL_DEDUP_RING.check_and_add(chat_id, msg_id):
+            # Keyed per account: with two accounts in one chat the second one
+            # used to see the message as a "duplicate" and ignore it.
+            if _GLOBAL_DEDUP_RING.check_and_add((my_id, chat_id), msg_id):
                 return
 
-        active_broadcaster = getattr(client, "_spambuster_broadcaster", broadcaster)
-        muted = is_peer_muted(my_id, event.sender_id, chat_id)
-
-        # A muted sender must not advance any broadcast counter either.
-        if not muted:
-            await active_broadcaster.handle_counter_event(chat_id)
-        else:
-            log_info(f"[MUTE] Чат {chat_id}: сообщение от {event.sender_id} скрыто по списку мута.")
-        if muted:
+        sender_id = event.sender_id
+        # Our own other accounts never count and are never "spam".
+        if sender_id is not None and _strip_peer_id(sender_id) in OWN_ACCOUNT_IDS:
             return
 
+        active_broadcaster = getattr(client, "_spambuster_broadcaster", broadcaster)
+        if is_peer_muted(my_id, sender_id, chat_id):
+            log_info(f"[MUTE] Чат {chat_id}: сообщение от {sender_id} скрыто по списку мута.")
+            return
+
+        # Counter broadcasts run in the background: a slow media upload must
+        # not delay spam clearing or command handling.
+        active_broadcaster.on_incoming_message(chat_id)
         if event.is_private:
             return
 
         text = event.raw_text or ""
+        message = event.message
 
-        if auto_read_spam:
-            # Resolve whether this message actually reached us. Without this the
-            # handler cleared advertising in every chat it happened to read, which
-            # is what removed ordinary replies from the conversation.
-            is_relevant_ping = bool(event.mentioned)
-            if not is_relevant_ping and event.is_reply:
-                try:
-                    reply_msg = await event.get_reply_message()
-                    if reply_msg and reply_msg.sender_id == my_id:
-                        is_relevant_ping = True
-                except Exception:
-                    pass
+        # Did this message actually reach us? (mention / reply to our post /
+        # our @handle typed in the text)
+        is_ping = bool(getattr(message, "mentioned", False))
+        reply_to_me = False
+        if not is_ping and event.is_reply:
+            try:
+                reply_msg = await event.get_reply_message()
+                reply_to_me = bool(reply_msg and reply_msg.sender_id == my_id)
+            except Exception:
+                reply_to_me = False
+            is_ping = reply_to_me
+        if not is_ping and my_username and text:
+            if re.search(rf"(?<![\w@])@{re.escape(my_username)}(?!\w)", text, re.IGNORECASE):
+                is_ping = True
 
-            if not is_relevant_ping and my_id and text:
-                # Our handle typed directly into the body, without an entity
-                if re.search(rf"(?<!\d)@{re.escape(my_username)}(?!\w)", text, re.IGNORECASE):
-                    is_relevant_ping = True
-
+        if auto_read_spam and is_ping:
             target_peer = getattr(event, "input_chat", None) or chat_id
-            if should_auto_read(text, event.message, is_ping=is_relevant_ping):
-                await clear_spam_mention(client, target_peer, event.message)
+            if should_auto_read(text, message, is_ping=True):
+                await clear_spam_mention(client, target_peer, message, account_id=my_id, chat_id=chat_id)
+            else:
+                note_genuine_ping(my_id, chat_id, msg_id or 0)
 
         if auto_sub and is_gatekeeper_text(text):
-            is_targeted = bool(event.mentioned)
-            if not is_targeted and event.is_reply:
-                try:
-                    reply_msg = await event.get_reply_message()
-                    if reply_msg and reply_msg.sender_id == my_id:
-                        is_targeted = True
-                except Exception:
-                    pass
-
-            if is_targeted or str(my_id) in text:
+            if is_ping or str(my_id) in text:
                 targets = set(extract_channel_links(text))
                 verify_coords = None
 
@@ -3124,24 +3179,53 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         template_name = session["template_name"]
         grouped_id = getattr(msg, "grouped_id", None)
 
-        if grouped_id and session["items"] and session["items"][-1].get("grouped_id") == grouped_id:
-            last_item = session["items"][-1]
-            last_item["forward_msg_ids"].append(msg.id)
-            if msg.media:
-                saved = await save_media_from_message(
-                    client,
-                    msg,
-                    template_name,
-                    item_index=len(session["items"]) - 1,
-                    clear_existing=False
+        # Albums arrive as N separate messages, handled concurrently. The old
+        # code downloaded the whole album for EVERY part (an album of 3 became
+        # 9 files) and, because the item was appended only after an await,
+        # parts could also become separate items. Both meant one post was sent
+        # as two or more. Register the album synchronously, download it once.
+        if grouped_id:
+            albums = session.setdefault("_albums", {})
+            existing = albums.get(grouped_id)
+            if existing is not None:
+                if msg.id not in existing["forward_msg_ids"]:
+                    existing["forward_msg_ids"].append(msg.id)
+                    existing["forward_msg_ids"].sort()
+                if (not existing["text"]) and (msg.raw_text or msg.entities):
+                    existing["text"] = msg.raw_text or ""
+                    existing["entities_hex"] = serialize_entities(msg.entities)
+                return
+            item = {
+                "text": text,
+                "entities_hex": serialize_entities(msg.entities),
+                "media_files": [],
+                "is_forward": bool(getattr(msg, "fwd_from", None)) or (session["session_type"] == "forwarded"),
+                "forward_chat_id": event.chat_id,
+                "forward_msg_ids": [msg.id],
+                "grouped_id": grouped_id,
+            }
+            albums[grouped_id] = item
+            session["items"].append(item)
+            item_index = len(session["items"]) - 1
+            await asyncio.sleep(1.5)  # let the remaining album parts arrive
+            try:
+                item["media_files"] = await save_media_from_message(
+                    client, msg, template_name, item_index=item_index, clear_existing=False
                 )
-                last_item["media_files"].extend(saved)
-            if (not last_item["text"]) and (msg.raw_text or msg.entities):
-                last_item["text"] = msg.raw_text or ""
-                last_item["entities_hex"] = serialize_entities(msg.entities)
+            except Exception as e:
+                log_error(f"[COLLECT] Не удалось скачать альбом: {e}")
+            await _notify(
+                event,
+                f"📥 Сообщение #{item_index + 1} (альбом, {len(item['media_files'])} медиа) добавлено в рассылку **{template_name}**.\n"
+                f"Отправьте следующее сообщение или напишите `.закрыть` (для отмены `.отменить`).",
+                auto_delete=4,
+                force_respond=True
+            )
             return
 
         item_index = len(session["items"])
+        placeholder: Dict[str, Any] = {}
+        session["items"].append(placeholder)  # reserve the slot before awaiting
         saved_media = []
         if msg.media:
             saved_media = await save_media_from_message(
@@ -3164,8 +3248,8 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             "forward_msg_ids": [msg.id],
             "grouped_id": grouped_id
         }
-        session["items"].append(item)
-        count = len(session["items"])
+        placeholder.update(item)
+        count = item_index + 1
         await _notify(
             event,
             f"📥 Сообщение #{count} добавлено в рассылку **{template_name}**.\n"
@@ -3179,7 +3263,12 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             session_key = (my_id, event.chat_id) if (my_id, event.chat_id) in ACTIVE_COLLECTORS else event.chat_id
         chat_id = event.chat_id
         template_name = session["template_name"]
-        items = [it for it in session["items"] if not is_internal_bot_message(it.get("text", ""))]
+        items = [
+            {k: v for k, v in it.items() if not k.startswith("_")}
+            for it in session["items"]
+            if it and (it.get("text") or it.get("media_files") or it.get("forward_msg_ids"))
+            and not is_internal_bot_message(it.get("text", ""))
+        ]
         session["items"] = items
 
         if not items:
@@ -3273,11 +3362,7 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             reply_msg = await event.get_reply_message()
             if reply_msg:
                 if getattr(reply_msg, "grouped_id", None):
-                    album_messages = []
-                    async for m in client.iter_messages(reply_msg.chat_id, limit=20):
-                        if getattr(m, "grouped_id", None) == reply_msg.grouped_id:
-                            album_messages.append(m)
-                    album_messages.sort(key=lambda x: x.id)
+                    album_messages = await fetch_album(client, reply_msg)
 
                     caption_msg = reply_msg
                     for m in album_messages:

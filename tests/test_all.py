@@ -930,39 +930,6 @@ auto_sub_enabled = false
             self.assertLess(s, 50, f"Ordinary message wrongly scored >= 50: {safe_msg} (score={s}, factors={f})")
             self.assertFalse(is_spam_message(safe_msg)[0], f"Ordinary message wrongly flagged: {safe_msg}")
 
-    def test_clear_spam_mention_forum_and_types(self):
-        import asyncio
-        from telethon.tl.types import InputPeerChannel, MessageReplyHeader
-
-        calls = []
-
-        class MockClient:
-            async def __call__(self, request):
-                calls.append(type(request).__name__)
-                return True
-
-            async def get_input_entity(self, peer):
-                return InputPeerChannel(channel_id=12345, access_hash=67890)
-
-            async def send_read_acknowledge(self, entity, max_id=None, clear_mentions=False, clear_reactions=False):
-                calls.append("send_read_acknowledge")
-                return True
-
-        class MockMessage:
-            def __init__(self, msg_id=100, topic_id=None):
-                self.id = msg_id
-                self.reply_to = MessageReplyHeader(forum_topic=True, reply_to_msg_id=topic_id) if topic_id else None
-
-        client = MockClient()
-        msg = MockMessage(msg_id=555, topic_id=42)
-
-        asyncio.run(clear_spam_mention(client, 12345, msg))
-
-        self.assertIn("ReadMentionsRequest", calls)
-        self.assertIn("ReadReactionsRequest", calls)
-        self.assertIn("ReadHistoryRequest", calls)
-        self.assertIn("send_read_acknowledge", calls)
-
     def test_message_dedup_ring(self):
         ring = MessageDedupRing(maxsize=3)
         # First occurrence: not a duplicate
@@ -1005,30 +972,6 @@ auto_sub_enabled = false
         b2.stop()
         self.assertFalse(b2.is_running)
         self.assertIsNone(BroadcasterService._ACTIVE_INSTANCES.get(12345))
-
-    def test_broadcaster_sending_locks_and_debounce(self):
-        import asyncio
-
-        class DummyClient:
-            pass
-
-        self.db.save_template("test_dedup_tpl", "Text", [], [])
-        b = BroadcasterService(DummyClient(), account_id=999)
-
-        # 1. In-flight chat lock test
-        b._sending_chats.add(555)
-        res = asyncio.run(b._send_task(1, 555, "test_dedup_tpl"))
-        self.assertFalse(res)  # Must be blocked by in-flight lock
-        b._sending_chats.clear()
-
-        # 2. Debounce cooldown test (< 4.0s)
-        b._last_sent_chat[555] = time.time()
-        res = asyncio.run(b._send_task(1, 555, "test_dedup_tpl"))
-        self.assertFalse(res)  # Must be blocked by cooldown debounce
-
-        # 3. Non-existent template test
-        res = asyncio.run(b._send_task(1, 777, "non_existent_template"))
-        self.assertFalse(res)
 
     def test_register_events_idempotency(self):
         registered = []

@@ -51,6 +51,12 @@ jobs:
           java-version: "17"
           distribution: temurin
 
+      # Chaquopy compiles the bundled Python with a host Python of the same
+      # version. Without this the runner default (3.12+) can break pip.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Sync bot.py to Android python sources
         run: |
           mkdir -p android/app/src/main/python

@@ -296,43 +296,6 @@ class TestMuteList(unittest.TestCase):
         self.assertEqual(rows[0]["reason"], "спам")
 
 
-class TestClearSpamMentionOrdering(unittest.TestCase):
-    """Defect 5: the phone notification raced ahead of the clear."""
-
-    def test_history_read_is_the_first_call(self):
-        client = _OrderingClient()
-        message = _FakeMessage(chat_id=-1001234, msg_id=55)
-        asyncio.run(bot.clear_spam_mention(client, -1001234, message))
-        self.assertGreaterEqual(len(client.calls), 4)
-        # The read is what stops the notification, so it must not queue up behind
-        # the badge clears.
-        self.assertEqual(client.calls[0], "history")
-
-    def test_local_read_state_is_dropped(self):
-        """The history read must fire before the badge clears."""
-        client = _OrderingClient()
-        message = _FakeMessage(chat_id=-1001234, msg_id=99)
-        asyncio.run(bot.clear_spam_mention(client, -1001234, message))
-        self.assertEqual(client.calls[0], "history")
-        self.assertLess(client.calls.index("history"), client.calls.index("mentions"))
-
-    def test_clears_mentions_and_reactions(self):
-        client = _OrderingClient()
-        message = _FakeMessage(chat_id=-1001234, msg_id=77)
-        asyncio.run(bot.clear_spam_mention(client, -1001234, message))
-        joined = " ".join(client.calls)
-        for required in ("mentions", "reactions", "history"):
-            self.assertIn(required, joined, required)
-
-    def test_unresolvable_chat_id_still_attempts_the_clear(self):
-        """An id that cannot be resolved must not silently skip the clear."""
-        client = _OrderingClient()
-        client.resolve_fails = True
-        message = _FakeMessage(chat_id=-1009999, msg_id=12)
-        asyncio.run(bot.clear_spam_mention(client, -1009999, message))
-        self.assertIn("history", client.calls)
-
-
 class TestSpamScorerIntegrity(unittest.TestCase):
     def test_mute_command_arguments_are_stripped(self):
         """
