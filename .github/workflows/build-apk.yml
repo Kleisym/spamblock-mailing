@@ -1,7 +1,5 @@
 name: Build & Release Android APK
 
-# touched to retrigger a runner-visible run
-
 on:
   push:
     branches: [ main, master ]
@@ -38,7 +36,7 @@ jobs:
           fi
 
       - name: Run test suite
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests -q
 
   build:
     name: Build & Release APK
@@ -89,18 +87,12 @@ jobs:
 
       - name: Publish Release with APK
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, "refs/tags/v")
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
-          name: Spambuster release
+          name: Spambuster ${{ github.ref_name }}
           make_latest: true
           body: |
-            Скачай **spambuster.apk** ниже, установи на телефон и нажми «Запустить».
-
-            - Вшит Python + Telethon (Chaquopy)
-            - Код авторизации и 2FA запрашиваются прямо в приложении
-            - Foreground Service + WakeLock: работает при закрытом приложении и заблокированном экране
-            - Автозапуск после перезагрузки телефона
-            - Автогашение спам-пингов только по реальным упоминаниям
+            Скачай spambuster.apk и поставь на телефон.
           files: dist/spambuster.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
