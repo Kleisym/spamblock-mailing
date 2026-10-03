@@ -13,6 +13,10 @@ _loop = None
 _is_running = False
 _bridge_lock = threading.Lock()
 
+# The supervisor loop polls the transport instead of blocking on it forever, so
+# a silently dead socket cannot leave the bot running but mute.
+SUPERVISOR_POLL_SECONDS = 20
+
 def is_running():
     global _is_running
     return _is_running
@@ -152,6 +156,7 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
                 _broadcaster = bot.BroadcasterService(current_client, account_id=me.id)
                 _broadcaster.start()
 
+            current_client._self_user = me
             if callback:
                 callback.onLoggedIn(username, int(me.id))
                 callback.onStatusChange(f"Работает ({username})", True)
@@ -179,9 +184,30 @@ def start_bot(api_id_val, api_hash_val, phone_val, password_2fa_val, files_dir_v
                         if callback:
                             callback.onStatusChange(f"Работает ({username})", True)
 
-                    await current_client.run_until_disconnected()
+                    # run_until_disconnected() returns the moment the transport
+                    # drops. On a phone that happens constantly: screen off,
+                    # doze, Wi-Fi to mobile handover, VPN toggle. Previously we
+                    # then sat in a bare sleep loop, so the client could stay
+                    # "connected" at the socket level while no updates ever
+                    # arrived again and the account went quiet for good.
+                    await asyncio.wait_for(
+                        current_client.run_until_disconnected(),
+                        timeout=SUPERVISOR_POLL_SECONDS,
+                    )
+                    if not _is_running:
+                        break
+                    if callback:
+                        callback.onStatusChange("Связь потеряна. Переподключение...", True)
+                    try:
+                        await current_client.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
                 except asyncio.CancelledError:
                     break
+                except asyncio.TimeoutError:
+                    # Expected: the poll window elapsed while still connected.
+                    continue
                 except Exception as e:
                     bot.log_error(f"[SUPERVISOR] Потеря связи (VPN выключен / смена сети): {e}. Автоматический реконнект через 3с...")
                     if callback:

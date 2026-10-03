@@ -335,6 +335,25 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_broadcast_tasks_chat ON broadcast_tasks (chat_id, is_active, mode);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_broadcast_tasks_active ON broadcast_tasks (is_active, mode, account_id);")
 
+            # One row per running folder broadcast. Tasks are still materialised
+            # per chat, but this registry is what lets the scheduler notice chats
+            # added to a folder after the broadcast was created.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS folder_broadcasts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER DEFAULT 0,
+                    folder_name TEXT,
+                    template_name TEXT,
+                    mode TEXT,
+                    interval_seconds INTEGER DEFAULT 0,
+                    counter_threshold INTEGER DEFAULT 0,
+                    is_active INTEGER DEFAULT 1,
+                    created_at REAL
+                )
+            """)
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_folder_broadcasts_unique ON folder_broadcasts (account_id, folder_name, template_name);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_folder_broadcasts_active ON folder_broadcasts (is_active, account_id);")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS chat_rotations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -346,6 +365,22 @@ class Database:
                     is_active INTEGER DEFAULT 1
                 )
             """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS muted_peers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER DEFAULT 0,
+                    peer_id INTEGER,
+        peer_key INTEGER,
+                    username TEXT,
+                    display_name TEXT,
+                    scope TEXT DEFAULT 'user',
+                    reason TEXT DEFAULT '',
+                    created_at REAL
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_muted_peers_lookup ON muted_peers (account_id, peer_key);")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_muted_peers_unique ON muted_peers (account_id, peer_key);")
 
             try:
                 cursor.execute("PRAGMA table_info(broadcast_tasks)")
@@ -448,6 +483,10 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM templates WHERE name = ? OR name = ?", (clean_name, f"<{clean_name}>"))
             cursor.execute("DELETE FROM broadcast_tasks WHERE template_name = ? OR template_name = ?", (clean_name, f"<{clean_name}>"))
+            cursor.execute(
+                "DELETE FROM folder_broadcasts WHERE template_name = ? OR template_name = ?",
+                (clean_name, f"<{clean_name}>")
+            )
             cursor.execute("SELECT id, template_names FROM chat_rotations")
             for r in cursor.fetchall():
                 names = json.loads(r["template_names"]) if r["template_names"] else []
@@ -520,6 +559,199 @@ class Database:
                     INSERT INTO broadcast_tasks (account_id, chat_id, template_name, mode, interval_seconds, counter_threshold, is_active, folder_name, last_sent_at)
                     VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0.0)
                 """, (account_id, chat_id, clean_name, mode, interval_seconds, counter_threshold, folder_name))
+
+    def register_folder_broadcast(
+        self,
+        folder_name: str,
+        template_name: str,
+        mode: str,
+        interval_seconds: int = 0,
+        counter_threshold: int = 0,
+        account_id: int = 0
+    ):
+        """Persist a folder-level broadcast so the scheduler can keep it in sync."""
+        clean_folder = (folder_name or "").strip()
+        clean_name = template_name.strip("<>").strip()
+        if not clean_folder:
+            return
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO folder_broadcasts
+                    (account_id, folder_name, template_name, mode, interval_seconds, counter_threshold, is_active, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(account_id, folder_name, template_name) DO UPDATE SET
+                    mode = excluded.mode,
+                    interval_seconds = excluded.interval_seconds,
+                    counter_threshold = excluded.counter_threshold,
+                    is_active = 1
+            """, (account_id, clean_folder, clean_name, mode, interval_seconds, counter_threshold, time.time()))
+
+    def get_active_folder_broadcasts(self, account_id: int = 0) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            if account_id:
+                rows = conn.execute(
+                    "SELECT * FROM folder_broadcasts WHERE is_active = 1 AND (account_id = ? OR account_id = 0)",
+                    (account_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM folder_broadcasts WHERE is_active = 1").fetchall()
+            return [dict(r) for r in rows]
+
+    def set_folder_broadcast_status(
+        self,
+        folder_name: Optional[str] = None,
+        name: Optional[str] = None,
+        is_active: int = 1,
+        account_id: int = 0
+    ) -> int:
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            conditions = []
+            params: List[Any] = [is_active]
+            if account_id:
+                conditions.append("(account_id = ? OR account_id = 0)")
+                params.append(account_id)
+            if folder_name:
+                conditions.append("folder_name = ?")
+                params.append(folder_name)
+            if name and name.lower() not in ("все", "all"):
+                clean_name = name.strip("<>").strip()
+                conditions.append("(template_name = ? OR template_name = ?)")
+                params.extend([clean_name, f"<{clean_name}>"])
+            where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+            cursor.execute(f"UPDATE folder_broadcasts SET is_active = ?{where_clause}", params)
+            return cursor.rowcount
+
+    def delete_folder_broadcasts(
+        self,
+        folder_name: Optional[str] = None,
+        name: Optional[str] = None,
+        account_id: int = 0
+    ) -> int:
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            conditions = []
+            params: List[Any] = []
+            if account_id:
+                conditions.append("(account_id = ? OR account_id = 0)")
+                params.append(account_id)
+            if folder_name:
+                conditions.append("folder_name = ?")
+                params.append(folder_name)
+            if name and name.lower() not in ("все", "all"):
+                clean_name = name.strip("<>").strip()
+                conditions.append("(template_name = ? OR template_name = ?)")
+                params.extend([clean_name, f"<{clean_name}>"])
+            where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+            cursor.execute(f"DELETE FROM folder_broadcasts{where_clause}", params)
+            return cursor.rowcount
+
+    def get_chats_in_broadcast(self, chat_id: int, template_name: str, account_id: int = 0) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            clean_name = template_name.strip("<>").strip()
+            row = conn.execute(
+                "SELECT * FROM broadcast_tasks WHERE chat_id = ? AND template_name = ? AND (account_id = ? OR account_id = 0)",
+                (chat_id, clean_name, account_id)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def ensure_broadcast_task(
+        self,
+        chat_id: int,
+        template_name: str,
+        mode: str,
+        interval_seconds: int = 0,
+        counter_threshold: int = 0,
+        folder_name: str = "",
+        account_id: int = 0
+    ) -> bool:
+        """
+        Idempotent enrolment used by the folder reconciler.
+
+        Returns True when a new task row was created. Crucially it never touches
+        last_sent_at on an existing row: add_or_update_broadcast() zeroes that
+        column, so re-registering every chat on every sync pass would reset every
+        interval timer and fire the whole broadcast on each tick.
+        """
+        clean_name = template_name.strip("<>").strip()
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT id, is_active, mode, interval_seconds, counter_threshold, account_id "
+                "FROM broadcast_tasks WHERE chat_id = ? AND template_name = ?",
+                (chat_id, clean_name)
+            ).fetchone()
+            if row is None:
+                cursor.execute(
+                    """
+                    INSERT INTO broadcast_tasks
+                        (account_id, chat_id, template_name, mode, interval_seconds,
+                         counter_threshold, is_active, folder_name, last_sent_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0.0)
+                    """,
+                    (account_id, chat_id, clean_name, mode, interval_seconds,
+                     counter_threshold, folder_name)
+                )
+                return True
+
+            # Re-activate when it was stopped or parked, and adopt config drift,
+            # but leave the send timer alone.
+            needs_update = (
+                not row["is_active"]
+                or row["mode"] != mode
+                or (row["interval_seconds"] or 0) != (interval_seconds or 0)
+                or (row["counter_threshold"] or 0) != (counter_threshold or 0)
+            )
+            if needs_update:
+                cursor.execute(
+                    """
+                    UPDATE broadcast_tasks
+                    SET account_id = ?, mode = ?, interval_seconds = ?,
+                        counter_threshold = ?, is_active = 1, folder_name = ?
+                    WHERE id = ?
+                    """,
+                    (account_id, mode, interval_seconds, counter_threshold,
+                     folder_name, row["id"])
+                )
+            return False
+
+    def get_enrolled_chat_ids(self, template_name: str, folder_name: str, account_id: int = 0) -> Set[int]:
+        """Chats currently carrying an active task for this folder broadcast."""
+        with self._conn() as conn:
+            clean_name = template_name.strip("<>").strip()
+            if account_id:
+                rows = conn.execute(
+                    "SELECT chat_id FROM broadcast_tasks "
+                    "WHERE template_name = ? AND folder_name = ? AND is_active = 1 "
+                    "AND (account_id = ? OR account_id = 0)",
+                    (clean_name, folder_name, account_id)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT chat_id FROM broadcast_tasks "
+                    "WHERE template_name = ? AND folder_name = ? AND is_active = 1",
+                    (clean_name, folder_name)
+                ).fetchall()
+            return {r["chat_id"] for r in rows}
+
+    def deactivate_broadcast_task(self, chat_id: int, template_name: str, account_id: int = 0) -> int:
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            clean_name = template_name.strip("<>").strip()
+            cursor.execute(
+                "UPDATE broadcast_tasks SET is_active = 0 "
+                "WHERE chat_id = ? AND template_name = ? AND (account_id = ? OR account_id = 0)",
+                (chat_id, clean_name, account_id)
+            )
+            return cursor.rowcount
+    def remove_template_from_folder_broadcasts(self, template_name: str):
+        clean_name = template_name.strip("<>").strip()
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM folder_broadcasts WHERE template_name = ? OR template_name = ?",
+                (clean_name, f"<{clean_name}>")
+            )
 
     def get_active_interval_tasks(self, account_id: int = 0) -> List[Dict[str, Any]]:
         with self._conn() as conn:
@@ -940,11 +1172,145 @@ class Database:
             cursor.execute("UPDATE chat_rotations SET current_index = ? WHERE id = ?", (next_idx, row["id"]))
             return template_name
 
+    def add_muted_peer(
+        self,
+        peer_id: int,
+        account_id: int = 0,
+        peer_key: Optional[int] = None,
+        username: str = "",
+        display_name: str = "",
+        scope: str = "user",
+        reason: str = ""
+    ) -> bool:
+        """Add a peer to the mute list. Returns True when newly added."""
+        if peer_key is None:
+            peer_key = peer_id
+        clean_username = (username or "").lstrip("@").strip().lower()
+        clean_name = (display_name or "").strip()
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO muted_peers
+                    (account_id, peer_id, peer_key, username, display_name, scope, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (account_id, peer_id, peer_key, clean_username, clean_name, scope, reason, time.time())
+            )
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    "UPDATE muted_peers SET username = COALESCE(NULLIF(?, ''), username), "
+                    "display_name = COALESCE(NULLIF(?, ''), display_name), scope = ? WHERE account_id = ? AND peer_key = ?",
+                    (clean_username, clean_name, scope, account_id, peer_key)
+                )
+                return False
+            return True
+
+    def remove_muted_peer(self, peer_id: int, account_id: int = 0, scope: str = "user") -> int:
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            if scope == "chat":
+                cursor.execute(
+                    "DELETE FROM muted_peers WHERE peer_key = ? AND scope = 'chat' AND (account_id = ? OR account_id = 0)",
+                    (peer_id, account_id)
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM muted_peers WHERE peer_key = ? AND scope != 'chat' AND (account_id = ? OR account_id = 0)",
+                    (peer_id, account_id)
+                )
+            return cursor.rowcount
+
+    def list_muted_peers(self, account_id: int = 0) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            if account_id:
+                rows = conn.execute(
+                    "SELECT * FROM muted_peers WHERE account_id = ? OR account_id = 0 ORDER BY created_at DESC",
+                    (account_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM muted_peers ORDER BY created_at DESC").fetchall()
+            return [dict(r) for r in rows]
+
+    def find_muted_peer_by_username(self, username: str, account_id: int = 0) -> Optional[Dict[str, Any]]:
+        clean = (username or "").lstrip("@").strip().lower()
+        if not clean:
+            return None
+        with self._conn() as conn:
+            if account_id:
+                row = conn.execute(
+                    "SELECT * FROM muted_peers WHERE username = ? AND (account_id = ? OR account_id = 0) LIMIT 1",
+                    (clean, account_id)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM muted_peers WHERE username = ? LIMIT 1", (clean,)
+                ).fetchone()
+        return dict(row) if row else None
+
 try:
     db = Database()
 except Exception:
     db = None
 ACTIVE_COLLECTORS: Dict[Any, Dict[str, Any]] = {}
+
+# Per-process index of muted peers so the hot incoming-message path never
+# touches sqlite. Rebuilt from the database on demand and after every change.
+_MUTE_CACHE: Dict[int, Set[int]] = {}
+_MUTE_CHAT_CACHE: Dict[int, Set[int]] = {}
+
+def _strip_peer_id(value: int) -> int:
+    """Telegram user ids arrive as 1000000000000+id; store and match the plain id."""
+    try:
+        v = int(value)
+    except Exception:
+        return value
+    if v > 1000000000000:
+        return v - 1000000000000
+    return v
+
+def mute_cache_rebuild(account_id: int = 0):
+    """Repopulate the in-memory mute index for an account."""
+    if db is None:
+        return
+    try:
+        with db._conn() as conn:
+            if account_id:
+                rows = conn.execute(
+                    "SELECT peer_key, scope FROM muted_peers WHERE account_id = ? OR account_id = 0",
+                    (account_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT peer_key, scope FROM muted_peers").fetchall()
+    except Exception:
+        return
+
+    users = _MUTE_CACHE.setdefault(account_id, set())
+    chats = _MUTE_CHAT_CACHE.setdefault(account_id, set())
+    users.clear()
+    chats.clear()
+    for r in rows:
+        try:
+            key = int(r["peer_key"])
+        except Exception:
+            continue
+        if (r["scope"] or "user") == "chat":
+            chats.add(key)
+        else:
+            users.add(key)
+
+def is_peer_muted(account_id: int, peer_id: Any, chat_id: Optional[int] = None) -> bool:
+    """True when the sender (or the chat itself) is muted for this account."""
+    if peer_id is None:
+        return False
+    try:
+        if _strip_peer_id(peer_id) in _MUTE_CACHE.get(account_id, set()):
+            return True
+        if chat_id is not None and int(chat_id) in _MUTE_CHAT_CACHE.get(account_id, set()):
+            return True
+    except Exception:
+        return False
+    return False
 
 SPAM_SIGNATURES = [
     # 1. Any broadcaster / userbot watermarks (Russian & English):
@@ -1199,31 +1565,44 @@ def calculate_spam_score(text: str, message: Any = None) -> Tuple[int, str, List
         factors.append(f"country_flags_{flag_count}(+35)")
 
     # =========================================================================
-    # 3. CONVERSATIONAL DAMPENERS (Protects regular users)
+    # 3. CONVERSATIONAL DAMPENERS (Protect regular users)
+    #    Dampeners are capped and can never cancel structural evidence.
+    #    Uncapped subtraction used to zero out real advertisements whenever
+    #    three cheap signals overlapped (-80 against +75), which is how ordinary
+    #    replies to our own posts ended up silently cleared.
     # =========================================================================
-    # Question mark without commercial routing indicates genuine inquiry
+    damp_points = 0
+
+    # A question mark without seller routing suggests inquiry, not advertising
     has_q_mark = "?" in clean_text
     if has_q_mark and not (has_emoji_contact or has_text_seller_contact):
-        score -= 30
-        factors.append("question_mark(-30)")
+        damp_points += 25
+        factors.append("question_mark(-25)")
 
     # Short single-line conversational messages (< 70 chars)
     if len(clean_text) < 70 and len(raw_lines) == 1:
-        score -= 30
-        factors.append("short_single_line(-30)")
+        damp_points += 25
+        factors.append("short_single_line(-25)")
 
-    # Conversational speech markers (я, мне, мы, ты, тебе, привет, спасибо, ку, хаха, лол)
+    # Conversational speech markers (я, мне, мы, ты, тебе, привет, спасибо, ку)
     conversational_markers = bool(re.search(
         r'\b(?:я|мне|меня|мы|нас|ты|тебе|тебя|привет|ку|здравствуйте|спасибо|спс|лол|хах|хд|ладно|норм|почему|зачем)\b',
         clean_text
     ))
     if conversational_markers and not (has_emoji_contact or bullet_lines >= 1):
-        score -= 20
-        factors.append("conversational_markers(-20)")
+        damp_points += 15
+        factors.append("conversational_markers(-15)")
+
+    score = max(0, score - min(damp_points, 40))
+
+    # A real buyer inquiry outranks every heuristic: it is never advertising
+    if is_genuine_buyer_question(text) and not (has_emoji_contact or has_text_seller_contact):
+        score = 0
+        factors.append("genuine_buyer_question(veto)")
 
     # Determine primary trigger
     primary_trigger = factors[0] if factors else "low_score"
-    return max(0, score), primary_trigger, factors
+    return score, primary_trigger, factors
 
 def is_spam_message(text: str, message: Any = None) -> Tuple[bool, str]:
     if not text:
@@ -1271,11 +1650,47 @@ def is_genuine_buyer_question(text: str) -> bool:
 
     return False
 
-def should_auto_read(text: str, message: Any = None) -> bool:
+def is_hard_spam(text: str, message: Any = None) -> Tuple[bool, str]:
+    """
+    Structural spam evidence strong enough to justify clearing on its own.
+    A human never produces these by accident: invisible ghost characters,
+    inline-bot posts and broadcaster watermarks.
+    """
+    if not text:
+        return False, ""
+    if message and getattr(message, "via_bot_id", None):
+        return True, "sent_via_inline_bot"
+    if re.search(r"[\u200b\u200c\u200e\u200f\u2060-\u206f\ufeff]", text):
+        return True, "invisible_ghost_ping"
+    clean = text.lower()
+    for pat in SPAM_PATTERNS:
+        if pat.search(clean):
+            return True, pat.pattern
+    return False, ""
+
+def should_auto_read(text: str, message: Any = None, is_ping: Optional[bool] = None) -> bool:
+    """
+    Auto-clear gate.
+
+    is_ping reports whether the message actually reached us (mention, reply to
+    our own post, or our handle in the body). Hard spam is always cleared;
+    heuristic advertising is cleared only when the message pinged us. An
+    ordinary message in a chat we happen to read therefore stays untouched.
+
+    is_ping=None keeps the legacy "judge the text alone" behaviour for callers
+    that carry no ping context.
+    """
     if is_genuine_buyer_question(text):
         return False
-    is_spam, _ = is_spam_message(text, message)
-    return is_spam
+
+    hard, _ = is_hard_spam(text, message)
+    if hard:
+        return True
+
+    if is_ping is False:
+        return False
+
+    return is_spam_message(text, message)[0]
 
 def is_gatekeeper_text(text: str) -> bool:
     if not text:
@@ -1515,7 +1930,12 @@ async def get_chats_in_folder(client: TelegramClient, folder_name: str) -> List[
     target_filter = None
 
     for f in getattr(result, "filters", []):
-        if isinstance(f, (DialogFilter, DialogFilterChatlist)):
+        # Duck-typed on purpose: Telegram has shipped several folder filter
+        # shapes (DialogFilter, DialogFilterChatlist and their successors), and
+        # an isinstance whitelist silently turned every unrecognised one into
+        # "folder not found". Matching on the title alone is what actually
+        # decides whether this filter is the folder we asked for.
+        if hasattr(f, "title") or hasattr(f, "id"):
             title = _extract_folder_title(f).lower()
             if title == target_clean:
                 target_filter = f
@@ -1525,7 +1945,7 @@ async def get_chats_in_folder(client: TelegramClient, folder_name: str) -> List[
         return []
 
     chat_ids = set()
-    for peer in list(getattr(target_filter, "include_peers", [])) + list(getattr(target_filter, "pinned_peers", [])):
+    for peer in list(getattr(target_filter, "include_peers", []) or []) + list(getattr(target_filter, "pinned_peers", []) or []):
         try:
             cid = utils.get_peer_id(peer)
             chat_ids.add(cid)
@@ -1663,8 +2083,20 @@ async def join_and_silence_target(
         pass
     return False
 
+
 async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: Any):
-    input_peer = None
+    """
+    Clear an advertisement that reached us: mark it read, then drop the mention and
+    reaction badges.
+
+    Ordering is the whole point of this function. The original version ran the
+    mention clear, then the reaction clear, then the history read, then the high
+    level acknowledge as four sequential round-trips. Telegram renders the push
+    notification from the incoming update itself, so the phone had already lit up
+    long before the history read fired, which is why ad notifications kept
+    arriving despite the script "catching" the ad. The history read now goes first
+    and the mention and reaction clears run concurrently behind it.
+    """
     from telethon.tl.types import (
         TypeInputPeer,
         InputPeerChannel,
@@ -1672,6 +2104,11 @@ async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: An
         InputPeerUser,
         InputChannel,
     )
+    from telethon.tl.functions.messages import ReadHistoryRequest as MessagesReadHistoryRequest
+    from telethon.tl.functions.channels import ReadHistoryRequest as ChannelReadHistoryRequest
+    from telethon.tl.functions.messages import ReadReactionsRequest
+
+    input_peer = None
     if isinstance(chat_peer, (TypeInputPeer, InputPeerChannel, InputPeerChat, InputPeerUser)):
         input_peer = chat_peer
     elif hasattr(message, "get_input_chat"):
@@ -1679,8 +2116,10 @@ async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: An
             input_peer = await message.get_input_chat()
         except Exception:
             pass
-    if not input_peer and hasattr(message, "input_chat"):
+
+    if not input_peer and getattr(message, "input_chat", None):
         input_peer = message.input_chat
+
     if not input_peer:
         try:
             input_peer = await client.get_input_entity(chat_peer)
@@ -1689,56 +2128,70 @@ async def clear_spam_mention(client: TelegramClient, chat_peer: Any, message: An
                 input_peer = await client.get_entity(chat_peer)
             except Exception:
                 pass
+
+    # A bare chat id with no resolvable peer must still be actionable: bailing out
+    # here left the badge untouched, which is exactly how ad notifications
+    # survived the clear.
     if not input_peer:
-        return
+        try:
+            input_peer = int(chat_peer)
+        except Exception:
+            return
 
     msg_id = getattr(message, "id", 0)
 
-    # Forum topic detection (support both reply_to_top_id and reply_to_msg_id when forum_topic is true)
+    # Forum topic detection: the badge lives on the topic, not the chat
     reply_to = getattr(message, "reply_to", None)
     top_id = getattr(reply_to, "reply_to_top_id", None)
     if not top_id and getattr(reply_to, "forum_topic", False):
         top_id = getattr(reply_to, "reply_to_msg_id", None)
 
-    # 1. Clear mentions
-    try:
-        if top_id:
-            await client(ReadMentionsRequest(peer=input_peer, top_msg_id=top_id))
-        await client(ReadMentionsRequest(peer=input_peer))
-    except Exception:
-        pass
-
-    # 2. Clear reactions
-    try:
-        from telethon.tl.functions.messages import ReadReactionsRequest
-        if top_id:
-            await client(ReadReactionsRequest(peer=input_peer, top_msg_id=top_id))
-        await client(ReadReactionsRequest(peer=input_peer))
-    except Exception:
-        pass
-
-    # 3. Mark read history
+    # 1. History read first. This is the request that stops the notification.
     if msg_id:
         try:
-            from telethon import utils
             if isinstance(input_peer, (InputPeerChannel, InputChannel)):
                 input_chan = utils.get_input_channel(input_peer)
-                from telethon.tl.functions.channels import ReadHistoryRequest as ChannelReadHistoryRequest
                 await client(ChannelReadHistoryRequest(channel=input_chan, max_id=msg_id))
             else:
-                from telethon.tl.functions.messages import ReadHistoryRequest as MessagesReadHistoryRequest
                 await client(MessagesReadHistoryRequest(peer=input_peer, max_id=msg_id))
         except Exception:
             pass
 
-    # 4. High-level acknowledge with mention and reaction clearing
+    # 2. Mention and reaction clears are independent of each other and of the
+    #    read above, so they run concurrently instead of in sequence.
+    async def _clear_mentions():
+        try:
+            if top_id:
+                await client(ReadMentionsRequest(peer=input_peer, top_msg_id=top_id))
+            await client(ReadMentionsRequest(peer=input_peer))
+        except Exception:
+            pass
+
+    async def _clear_reactions():
+        try:
+            if top_id:
+                await client(ReadReactionsRequest(peer=input_peer, top_msg_id=top_id))
+            await client(ReadReactionsRequest(peer=input_peer))
+        except Exception:
+            pass
+
+    await asyncio.gather(_clear_mentions(), _clear_reactions(), return_exceptions=True)
+
+    # 3. Final acknowledge keeps Telethon's own bookkeeping in sync.
     try:
-        await client.send_read_acknowledge(input_peer, max_id=msg_id, clear_mentions=True, clear_reactions=True)
+        await client.send_read_acknowledge(
+            input_peer,
+            max_id=msg_id,
+            clear_mentions=False,
+            clear_reactions=False,
+        )
     except Exception:
         pass
 
+
 class BroadcasterService:
     _ACTIVE_INSTANCES: Dict[int, 'BroadcasterService'] = {}
+    FOLDER_SYNC_INTERVAL = 60.0
 
     def __init__(self, client: TelegramClient, account_id: int = 0):
         self.client = client
@@ -1747,6 +2200,8 @@ class BroadcasterService:
         self._task: Optional[asyncio.Task] = None
         self._sending_chats: Set[int] = set()
         self._last_sent_chat: Dict[int, float] = {}
+        self._folder_cache: Dict[Tuple[str, str], Tuple[float, List[int]]] = {}
+        self._last_folder_log: Dict[Tuple[str, str], float] = {}
 
     def start(self):
         # Stop any previous active instance for this account to prevent duplicate background loops
@@ -1776,13 +2231,99 @@ class BroadcasterService:
         if self._task and not self._task.done():
             self._task.cancel()
         self._sending_chats.clear()
+        self._folder_cache.clear()
         if BroadcasterService._ACTIVE_INSTANCES.get(self.account_id) is self:
             BroadcasterService._ACTIVE_INSTANCES.pop(self.account_id, None)
+
+    async def sync_folder_broadcasts(self) -> int:
+        """
+        Reconcile every active folder broadcast against the live folder contents.
+
+        Chats added to a folder while a broadcast is already running were never
+        enrolled: folder_name was read exactly once, when the broadcast was
+        created, and only already-materialised tasks were ever scheduled. This
+        walks each registered folder, enrols chats that appeared, and parks tasks
+        for chats that were removed from the folder.
+        """
+        folder_broadcasts = db.get_active_folder_broadcasts(account_id=self.account_id)
+        if not folder_broadcasts:
+            return 0
+
+        enrolled_total = 0
+        for fb in folder_broadcasts:
+            folder_name = (fb.get("folder_name") or "").strip()
+            template_name = fb.get("template_name") or ""
+            if not folder_name or not template_name:
+                continue
+
+            cache_key = (folder_name, template_name)
+            try:
+                live_chats = await get_chats_in_folder(self.client, folder_name)
+            except Exception as e:
+                log_error(f"[FOLDER] Не удалось прочитать папку \"{folder_name}\": {e}")
+                continue
+
+            if not live_chats:
+                continue
+
+            live_set = set(live_chats)
+            previous = self._folder_cache.get(cache_key)
+            previous_set = set(previous[1]) if previous else set()
+
+            # The database is the source of truth for enrolment. Diffing the
+            # in-memory snapshot alone missed chats that were enrolled before the
+            # process restarted, and a cold cache made the first pass a no-op.
+            enrolled_set = db.get_enrolled_chat_ids(template_name, folder_name, account_id=self.account_id)
+            added = live_set - enrolled_set
+            removed = enrolled_set - live_set
+
+            for cid in sorted(added):
+                try:
+                    created = db.ensure_broadcast_task(
+                        account_id=self.account_id,
+                        chat_id=cid,
+                        template_name=template_name,
+                        mode=fb.get("mode") or "interval",
+                        interval_seconds=fb.get("interval_seconds") or 0,
+                        counter_threshold=fb.get("counter_threshold") or 0,
+                        folder_name=folder_name
+                    )
+                    if created:
+                        enrolled_total += 1
+                except Exception as e:
+                    log_error(f"[FOLDER] Не удалось добавить чат {cid} в рассылку \"{template_name}\": {e}")
+                    continue
+
+            for cid in sorted(removed):
+                try:
+                    db.deactivate_broadcast_task(cid, template_name, account_id=self.account_id)
+                except Exception as e:
+                    log_error(f"[FOLDER] Не удалось снять чат {cid} с рассылки \"{template_name}\": {e}")
+
+            self._folder_cache[cache_key] = (time.time(), list(live_chats))
+
+            if added or removed:
+                last_log = self._last_folder_log.get(cache_key, 0.0)
+                if time.time() - last_log > 60.0:
+                    self._last_folder_log[cache_key] = time.time()
+                    if added:
+                        log_info(
+                            f"[FOLDER] Рассылка \"{template_name}\" (\"{folder_name}\"): "
+                            f"+{len(added)} новых чатов, всего {len(live_set)}"
+                        )
+                    if removed:
+                        log_info(
+                            f"[FOLDER] Рассылка \"{template_name}\" (\"{folder_name}\"): "
+                            f"-{len(removed)} чатов убрано из папки, осталось {len(live_set)}"
+                        )
+
+        return enrolled_total
 
     async def _loop(self):
         import gc
         last_gc = time.time()
         last_collector_clean = time.time()
+        last_folder_sync = 0.0
 
         while self.is_running:
             try:
@@ -1799,6 +2340,13 @@ class BroadcasterService:
                 if now - last_gc > 600:
                     gc.collect()
                     last_gc = now
+
+                # Re-resolve every folder-backed broadcast on a fixed cadence so
+                # chats added to a folder after the broadcast was created are
+                # picked up automatically instead of waiting for a restart.
+                if now - last_folder_sync >= self.FOLDER_SYNC_INTERVAL:
+                    await self.sync_folder_broadcasts()
+                    last_folder_sync = now
 
                 tasks = db.get_active_interval_tasks(account_id=self.account_id)
                 for task in tasks:
@@ -2004,6 +2552,16 @@ HELP_TEXT = """
 **8. Антиспам и авто-подписка:**
 • Моментально гасит спам-пинги и пуши на телефон от скупов и авто-ботов.
 • Автоматически вступает в каналы/боты по требованию капчи админов, мьютит их и убирает в папку `автосабнутое`.
+* Обычные ответы в чате больше не помечаются прочитанными — автогашение работает только по реальным пингам.
+
+**9. Заглушение конкретных людей:**
+* `.мутить` — ответьте командой на сообщение (самый точный способ)
+* `.мутить `@username`
+* `.мутить 123456789`
+* `.мутить 123456789 причина` — сохранит причину
+* `.размутить `@username` или `.размутить 123456789`
+* `.заглушенные` — список всех как заглушены
+*(Заглушенные не запускают авто-подписку и не увеличивают счётчик рассылки)*
 """
 
 def _extract_collector_flag(text: str) -> Tuple[Optional[str], str]:
@@ -2029,6 +2587,36 @@ def _extract_quoted_folder(text: str) -> Tuple[str, str]:
         cleaned = text[:match.start()] + text[match.end():]
         return folder, cleaned.strip()
     return "", text.strip()
+
+def _strip_command_word(text: str) -> str:
+    """
+    Drop the leading command word (and its dot) from an argument string.
+
+    Commands reach the handlers as the full raw line, so without this the first
+    token is always ".мутить"/".mute" rather than the actual argument. Both mute
+    handlers compare parts[0] against the numeric and username patterns, so an
+    unstripped command word made every ".мутить @user" and ".мутить 123456789"
+    form fail silently.
+    """
+    text = (text or "").strip()
+    tokens = text.split(None, 1)
+    if not tokens:
+        return ""
+    first = tokens[0]
+    if first.startswith("."):
+        return tokens[1] if len(tokens) > 1 else ""
+
+    # Multiline form: the command sits alone on the first line and the target
+    # follows on the next one.
+    lines = text.splitlines()
+    if len(lines) > 1 and not lines[0].strip().startswith("@"):
+        return "\n".join(lines[1:]).strip()
+
+    # Single-line form without a dot (some clients strip the leading dot): strip
+    # the first word so the argument, not the verb, reaches the resolver.
+    if len(tokens) > 1:
+        return tokens[1]
+    return ""
 
 def _format_seconds(sec: int) -> str:
     if sec <= 0:
@@ -2234,6 +2822,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
     auto_read_spam = acc_cfg.get("auto_read_spam_pings", True)
     auto_sub = acc_cfg.get("auto_sub_enabled", True)
     auto_folder = acc_cfg.get("auto_sub_folder", "автосабнутое")
+    my_username = getattr(getattr(client, "_self_user", None), "username", None) or acc_cfg.get("username") or ""
+
+    # Warm the mute index so the very first incoming message is filtered too.
+    mute_cache_rebuild(my_id)
 
     @client.on(events.NewMessage(incoming=True))
     async def incoming_handler(event: Any):
@@ -2244,7 +2836,15 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 return
 
         active_broadcaster = getattr(client, "_spambuster_broadcaster", broadcaster)
-        await active_broadcaster.handle_counter_event(chat_id)
+        muted = is_peer_muted(my_id, event.sender_id, chat_id)
+
+        # A muted sender must not advance any broadcast counter either.
+        if not muted:
+            await active_broadcaster.handle_counter_event(chat_id)
+        else:
+            log_info(f"[MUTE] Чат {chat_id}: сообщение от {event.sender_id} скрыто по списку мута.")
+        if muted:
+            return
 
         if event.is_private:
             return
@@ -2252,7 +2852,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
         text = event.raw_text or ""
 
         if auto_read_spam:
-            is_relevant_ping = event.mentioned
+            # Resolve whether this message actually reached us. Without this the
+            # handler cleared advertising in every chat it happened to read, which
+            # is what removed ordinary replies from the conversation.
+            is_relevant_ping = bool(event.mentioned)
             if not is_relevant_ping and event.is_reply:
                 try:
                     reply_msg = await event.get_reply_message()
@@ -2261,15 +2864,17 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 except Exception:
                     pass
 
-            # Auto-clear if the message is detected as spam, or if it pinged us and matches spam checks
+            if not is_relevant_ping and my_id and text:
+                # Our handle typed directly into the body, without an entity
+                if re.search(rf"(?<!\d)@{re.escape(my_username)}(?!\w)", text, re.IGNORECASE):
+                    is_relevant_ping = True
+
             target_peer = getattr(event, "input_chat", None) or chat_id
-            if should_auto_read(text, event.message):
-                await clear_spam_mention(client, target_peer, event.message)
-            elif is_relevant_ping and is_spam_message(text, event.message)[0]:
+            if should_auto_read(text, event.message, is_ping=is_relevant_ping):
                 await clear_spam_mention(client, target_peer, event.message)
 
         if auto_sub and is_gatekeeper_text(text):
-            is_targeted = event.mentioned
+            is_targeted = bool(event.mentioned)
             if not is_targeted and event.is_reply:
                 try:
                     reply_msg = await event.get_reply_message()
@@ -2357,7 +2962,10 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                     ".рассыл", ".broadcast", ".чередовать", ".чередование", ".ротация", ".rotate", ".стоп", ".stop",
                     ".продолжить", ".resume", ".удалить", ".delete", ".просмотр", ".view",
                     ".инструкция", ".help", ".чередования", ".ротации", ".rotations",
-                    ".закончить", ".завершить", ".готово"
+                    ".закончить", ".завершить", ".готово",
+                    ".мутить", ".мут", ".mute", ".ignore",
+                    ".размутить", ".размут", ".unmute", ".unignore",
+                    ".заглушенные", ".мутлист", ".mutelist"
                 )):
                     ACTIVE_COLLECTORS.pop(c_key, None)
                 else:
@@ -2401,6 +3009,18 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
 
         if cmd in (".чередования", ".ротации", ".rotations"):
             await handle_list_rotations(event)
+            return
+
+        if cmd in (".мутить", ".мут", ".mute", ".ignore"):
+            await handle_mute(event, raw)
+            return
+
+        if cmd in (".размутить", ".размут", ".unmute", ".unignore"):
+            await handle_unmute(event, raw)
+            return
+
+        if cmd in (".заглушенные", ".мутлист", ".mutelist"):
+            await handle_mute_list(event)
             return
 
         if cmd in (".стоп", ".stop"):
@@ -2605,6 +3225,16 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 folder_name=folder_name
             )
 
+        if folder_name:
+            db.register_folder_broadcast(
+                folder_name=folder_name,
+                template_name=template_name,
+                mode=mode,
+                interval_seconds=interval_sec,
+                counter_threshold=threshold_count,
+                account_id=my_id
+            )
+
         ACTIVE_COLLECTORS.pop(session_key, None)
 
         if mode == "interval":
@@ -2707,6 +3337,16 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 folder_name=folder_name
             )
 
+        if folder_name:
+            db.register_folder_broadcast(
+                folder_name=folder_name,
+                template_name=template_name,
+                mode=mode,
+                interval_seconds=interval_sec,
+                counter_threshold=threshold_count,
+                account_id=my_id
+            )
+
         if mode == "interval":
             details = f"каждые {_format_seconds(interval_sec)}"
         elif mode == "hybrid":
@@ -2790,6 +3430,179 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             else:
                 await _notify(event, f"⚠️ Чередование **{target_name}** не найдено.")
 
+    async def _resolve_mute_target(event: Any, raw_args: str) -> Optional[Dict[str, Any]]:
+        """
+        Resolve a mute target from a command argument.
+
+        Accepted forms, in priority order:
+          .мутить                    -> reply to the message (recommended)
+          .мутить @username          -> resolve the handle
+          .мутить 123456789          -> bare user id
+          .мутить 123456789 причина  -> bare user id plus a stored reason
+        """
+        args = raw_args.strip()
+        reason = ""
+        parts = [p for p in args.split() if p]
+        if len(parts) > 1 and re.fullmatch(r"-?\d{5,}", parts[0]):
+            reason = " ".join(parts[1:]).strip()
+
+        # 1. Reply form wins: it is the only unambiguous source of identity.
+        if event.is_reply:
+            try:
+                reply_msg = await event.get_reply_message()
+            except Exception:
+                reply_msg = None
+            if reply_msg is not None:
+                sender_id = getattr(reply_msg, "sender_id", None)
+                if sender_id is None:
+                    return None
+                peer_key = _strip_peer_id(sender_id)
+                display_name = ""
+                username = ""
+                try:
+                    sender = await reply_msg.get_sender()
+                    display_name = getattr(sender, "title", None) or " ".join(
+                        filter(None, [getattr(sender, "first_name", None), getattr(sender, "last_name", None)])
+                    )
+                    username = getattr(sender, "username", None) or ""
+                except Exception:
+                    pass
+                if not reason:
+                    reason = (reply_msg.raw_text or "")[:80].strip()
+                return {
+                    "peer_id": sender_id,
+                    "peer_key": peer_key,
+                    "username": username,
+                    "display_name": display_name or f"id {peer_key}",
+                    "scope": "user",
+                    "reason": reason,
+                }
+
+        if not parts:
+            return None
+
+        token = parts[0]
+
+        # 2. Numeric id
+        if re.fullmatch(r"-?\d{5,}", token):
+            raw_id = int(token)
+            peer_key = _strip_peer_id(raw_id)
+            display_name = f"id {peer_key}"
+            username = ""
+            try:
+                entity = await client.get_entity(peer_key)
+                display_name = (
+                    getattr(entity, "title", None)
+                    or " ".join(filter(None, [getattr(entity, "first_name", None), getattr(entity, "last_name", None)]))
+                    or display_name
+                )
+                username = getattr(entity, "username", None) or ""
+            except Exception:
+                pass
+            return {
+                "peer_id": raw_id,
+                "peer_key": peer_key,
+                "username": username,
+                "display_name": display_name,
+                "scope": "user",
+                "reason": reason,
+            }
+
+        # 3. Username
+        if token.startswith("@") or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", token):
+            handle = token.lstrip("@")
+            try:
+                entity = await client.get_entity(handle)
+            except Exception:
+                return None
+            raw_id = utils.get_peer_id(entity)
+            peer_key = _strip_peer_id(raw_id)
+            display_name = (
+                getattr(entity, "title", None)
+                or " ".join(filter(None, [getattr(entity, "first_name", None), getattr(entity, "last_name", None)]))
+                or f"@{handle}"
+            )
+            return {
+                "peer_id": raw_id,
+                "peer_key": peer_key,
+                "username": getattr(entity, "username", None) or handle,
+                "display_name": display_name,
+                "scope": "user",
+                "reason": reason,
+            }
+
+        return None
+
+    async def handle_mute(event: Any, raw: str):
+        _, args = _extract_quoted_folder(raw)
+        target = await _resolve_mute_target(event, _strip_command_word(args))
+        if not target:
+            await _notify(
+                event,
+                "⚠️ Не понял кого мутить.\n"
+                "Формы:\n"
+                "• `.мутить` — ответьте командой на сообщение\n"
+                "• `.мутить @username`\n"
+                "• `.мутить 123456789`\n"
+                "• `.мутить 123456789 причина`",
+            )
+            return
+
+        added = db.add_muted_peer(
+            peer_id=target["peer_id"],
+            account_id=my_id,
+            peer_key=target["peer_key"],
+            username=target["username"],
+            display_name=target["display_name"],
+            scope=target["scope"],
+            reason=target["reason"],
+        )
+        mute_cache_rebuild(my_id)
+        verb = "Заглушен" if added else "Уже был заглушен"
+        reason_str = f"\nПричина: {target['reason']}" if target["reason"] else ""
+        await _notify(event, f"🔇 {verb}: **{target['display_name']}**{reason_str}")
+
+    async def handle_unmute(event: Any, raw: str):
+        _, args = _extract_quoted_folder(raw)
+        args_clean = _strip_command_word(args).strip()
+        if not args_clean:
+            await _notify(event, "⚠️ Укажите @username или id, либо ответьте командой на сообщение.")
+            return
+
+        target = await _resolve_mute_target(event, args_clean)
+        if target:
+            removed = db.remove_muted_peer(target["peer_key"], account_id=my_id, scope=target["scope"])
+        else:
+            token = args_clean.split()[0].lstrip("@")
+            found = db.find_muted_peer_by_username(token, account_id=my_id)
+            if found:
+                removed = db.remove_muted_peer(found["peer_key"], account_id=my_id, scope=found.get("scope") or "user")
+                target = {"display_name": found.get("display_name") or f"@{token}"}
+            else:
+                removed = 0
+                target = {"display_name": token}
+
+        mute_cache_rebuild(my_id)
+        if removed:
+            await _notify(event, f"🔊 Разглушен: **{target['display_name']}**")
+        else:
+            await _notify(event, f"ℹ️ **{target['display_name']}** не был в списке заглушенных.")
+
+    async def handle_mute_list(event: Any):
+        rows = db.list_muted_peers(account_id=my_id)
+        if not rows:
+            await _notify(event, "🔇 Список заглушенных пуст.")
+            return
+        lines = ["🔇 **Заглушенные:**\n"]
+        for r in rows[:50]:
+            handle = f"@{r['username']}" if r["username"] else f"id {r['peer_key']}"
+            label = r["display_name"] or handle
+            reason = f" — {r['reason']}" if r["reason"] else ""
+            lines.append(f"• {label} (`{handle}`){reason}")
+        if len(rows) > 50:
+            lines.append(f"\n…и ещё {len(rows) - 50}")
+        await _notify(event, "\n".join(lines), auto_delete=25)
+
     async def handle_list_rotations(event: Any):
         named = db.list_named_rotations(account_id=my_id)
         chat_rot = db.get_chat_rotation(event.chat_id, account_id=my_id)
@@ -2840,6 +3653,13 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             if named_rot:
                 with db._conn() as conn:
                     conn.execute("UPDATE chat_rotations SET is_active = 0 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)", (target_name, f"<{target_name}>", my_id))
+
+        db.set_folder_broadcast_status(
+            folder_name=folder_name or None,
+            name=target_name,
+            is_active=0,
+            account_id=my_id
+        )
         folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
         await _notify(event, f"⏹ Остановлено рассылок: {count}{folder_str}")
 
@@ -2869,6 +3689,13 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
             if named_rot:
                 with db._conn() as conn:
                     conn.execute("UPDATE chat_rotations SET is_active = 1 WHERE (name = ? OR name = ?) AND (account_id = ? OR account_id = 0)", (target_name, f"<{target_name}>", my_id))
+
+        db.set_folder_broadcast_status(
+            folder_name=folder_name or None,
+            name=target_name,
+            is_active=1,
+            account_id=my_id
+        )
         folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
         await _notify(event, f"▶️ Возобновлено рассылок: {count}{folder_str}")
 
@@ -2899,6 +3726,12 @@ def register_events(client: TelegramClient, broadcaster: BroadcasterService, my_
                 if remaining_tasks == 0:
                     db.delete_template(target_name)
                     db.delete_named_rotation(target_name, account_id=my_id)
+
+        db.delete_folder_broadcasts(
+            folder_name=folder_name or None,
+            name=target_name,
+            account_id=my_id
+        )
 
         folder_str = f" в папке \"{folder_name}\"" if folder_name else ""
         await _notify(event, f"🗑 Удалено рассылок: {count}{folder_str}")
@@ -3034,6 +3867,7 @@ async def run_single_account(acc_cfg: Dict[str, Any]):
     broadcaster = BroadcasterService(client, account_id=me.id)
     broadcaster.start()
 
+    client._self_user = me
     register_events(client, broadcaster, me.id, acc_cfg=acc_cfg)
 
     print(f"✅ Аккаунт [{acc_name}] {username_str} (ID: {me.id}) подключен и запущен 24/7!")

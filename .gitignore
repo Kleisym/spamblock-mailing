@@ -1,0 +1,50 @@
+# Python & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Sensitive Telegram & user config
+config.txt
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+config.local.txt
+*.env
+
+# Databases & local storage
+storage/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+test_*.db
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+
+# Android build outputs & local config
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+.idea/
+*.iml
+
+# Bench scratch: verification artefacts, baseline snapshots, helper scripts.
+# These hold duplicate copies of the source tree and are not part of the app.
+.bench/
+*.orig
+*.rej

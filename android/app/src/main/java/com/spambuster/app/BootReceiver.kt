@@ -12,7 +12,9 @@ class BootReceiver : BroadcastReceiver() {
         if (action == Intent.ACTION_BOOT_COMPLETED ||
             action == "android.intent.action.QUICKBOOT_POWERON" ||
             action == "com.htc.intent.action.QUICKBOOT_POWERON" ||
-            action == Intent.ACTION_MY_PACKAGE_REPLACED
+            action == Intent.ACTION_MY_PACKAGE_REPLACED ||
+            action == "android.intent.action.QUICKBOOT" ||
+            action == "com.samsung.intent.action.QUICKBOOT_POWERON"
         ) {
             val prefs = context.getSharedPreferences(SpambusterService.PREFS_NAME, Context.MODE_PRIVATE)
             val isEnabled = prefs.getBoolean(SpambusterService.KEY_SERVICE_ENABLED, false)

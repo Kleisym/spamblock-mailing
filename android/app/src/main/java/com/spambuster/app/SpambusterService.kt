@@ -21,6 +21,7 @@ class SpambusterService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var heartbeat: Runnable? = null
 
     companion object {
         const val CHANNEL_ID = "spambuster_service_channel"
@@ -28,10 +29,16 @@ class SpambusterService : Service() {
         const val ACTION_STOP = "com.spambuster.app.ACTION_STOP"
         const val PREFS_NAME = "spambuster_prefs"
         const val KEY_SERVICE_ENABLED = "service_enabled"
+        const val ACTION_HEARTBEAT = "com.spambuster.app.ACTION_HEARTBEAT"
+        private const val HEARTBEAT_INTERVAL_MS = 60000L
+        private const val WAKE_LOCK_TAG = "Spambuster::RuntimeWakeLock"
 
         @Volatile
         var activePythonThread: Thread? = null
         val threadLock = Any()
+
+        @Volatile
+        var runtimeWakeLock: PowerManager.WakeLock? = null
     }
 
     override fun onCreate() {
@@ -46,14 +53,95 @@ class SpambusterService : Service() {
         }
 
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putBoolean(KEY_SERVICE_ENABLED, true).apply()
+        // A null intent means the system restarted us after killing the
+        // process. Only honour that restart if the user had not asked us to
+        // stop, otherwise the service would resurrect itself after "Стоп".
+        val restartingFromOemKill = intent == null
+        if (restartingFromOemKill && !prefs.getBoolean(KEY_SERVICE_ENABLED, false)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (!restartingFromOemKill) {
+            prefs.edit().putBoolean(KEY_SERVICE_ENABLED, true).apply()
+        }
 
         val notification = buildForegroundNotification("Инициализация юзербота...")
         startForeground(NOTIFICATION_ID, notification)
 
+        acquireRuntimeWakeLock()
+        startHeartbeat()
         startPythonBot()
 
         return START_STICKY
+    }
+
+    /**
+     * Hold a PARTIAL_WAKE_LOCK for the lifetime of the service.
+     *
+     * The old code only had an unused 30 second temporary lock, so once the
+     * screen went off the CPU was allowed to sleep, the asyncio loop stalled and
+     * the account silently stopped answering.
+     */
+    private fun acquireRuntimeWakeLock() {
+        if (runtimeWakeLock?.isHeld == true) return
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            runtimeWakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                WAKE_LOCK_TAG
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+            // Wake lock unavailable: the foreground service still keeps the
+            // process alive, only CPU-idle hibernation stays possible.
+        }
+    }
+
+    private fun releaseRuntimeWakeLock() {
+        try {
+            runtimeWakeLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+            // ignore
+        }
+        runtimeWakeLock = null
+    }
+
+    /**
+     * Re-issue startForeground on a timer.
+     *
+     * MIUI/HyperOS/OneUI and stock Android all quietly demote or kill a
+     * foreground service that has not been refreshed. A periodic startForeground
+     * keeps the service pinned in the "running services" list so leaving the app
+     * or locking the phone no longer stops the bot.
+     */
+    private fun startHeartbeat() {
+        stopHeartbeat()
+        val tick = object : Runnable {
+            override fun run() {
+                if (BotBridgeCoordinator.isBotRunning) {
+                    try {
+                        val manager = getSystemService(NotificationManager::class.java)
+                        manager?.notify(
+                            NOTIFICATION_ID,
+                            buildForegroundNotification(BotBridgeCoordinator.lastStatus)
+                        )
+                    } catch (e: Exception) {
+                        // notification refresh is best effort
+                    }
+                }
+                mainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
+            }
+        }
+        heartbeat = tick
+        mainHandler.postDelayed(tick, HEARTBEAT_INTERVAL_MS)
+    }
+
+    private fun stopHeartbeat() {
+        heartbeat?.let { mainHandler.removeCallbacks(it) }
+        heartbeat = null
     }
 
     private fun startPythonBot() {
@@ -214,6 +302,7 @@ class SpambusterService : Service() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putBoolean(KEY_SERVICE_ENABLED, false).apply()
 
+        stopHeartbeat()
         BotBridgeCoordinator.cancelWait()
 
         synchronized(threadLock) {
@@ -239,12 +328,19 @@ class SpambusterService : Service() {
         wakeLock?.let {
             if (it.isHeld) it.release()
         }
+        releaseRuntimeWakeLock()
         stopForeground(true)
         stopSelf()
     }
 
     override fun onDestroy() {
-        stopForegroundService()
+        // Deliberately not calling stopForegroundService() here.
+        // onDestroy() also runs when the OEM or the system kills the process for
+        // memory. Clearing KEY_SERVICE_ENABLED there meant the service could
+        // never come back after the very kills we need it to survive.
+        stopHeartbeat()
+        releaseRuntimeWakeLock()
+        wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
     }
 

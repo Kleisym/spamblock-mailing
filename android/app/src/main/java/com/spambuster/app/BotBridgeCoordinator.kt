@@ -36,7 +36,10 @@ object BotBridgeCoordinator {
         isWaitingForCode = true
         codeLatch = CountDownLatch(1)
         try {
-            codeLatch?.await()
+            // Bounded wait. The Python interpreter is a single global lock: an
+            // unbounded await here froze the whole bot if the user backgrounded
+            // the app or missed the dialog, and nothing ever recovered.
+            codeLatch?.await(AUTH_TIMEOUT_MINUTES, java.util.concurrent.TimeUnit.MINUTES)
         } catch (e: InterruptedException) {
             return ""
         } finally {
@@ -55,7 +58,7 @@ object BotBridgeCoordinator {
         isWaitingForPassword = true
         passwordLatch = CountDownLatch(1)
         try {
-            passwordLatch?.await()
+            passwordLatch?.await(AUTH_TIMEOUT_MINUTES, java.util.concurrent.TimeUnit.MINUTES)
         } catch (e: InterruptedException) {
             return ""
         } finally {
@@ -78,4 +81,6 @@ object BotBridgeCoordinator {
         codeLatch?.countDown()
         passwordLatch?.countDown()
     }
+
+    private const val AUTH_TIMEOUT_MINUTES = 5L
 }
